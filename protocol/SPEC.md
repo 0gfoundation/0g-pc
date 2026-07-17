@@ -108,10 +108,8 @@ enclave select the right key across rotations.
 
 The router **ranks** candidates on its live fleet view; the client **pins** one
 and does its own **fallback loop**. The router honors the pin and forwards the
-JSON opaquely — it does not re-route or decrypt. (Approach A / phase i-a of
-`docs/design/router-e2e.md`; Approach B — a router-in-TEE that decrypts and
-re-selects — reuses the same envelope with the recipient being the router enclave
-and is not v1.)
+JSON opaquely — it does not re-route or decrypt. (Phase i-a of
+`../docs/design/router-e2e.md`.)
 
 **Control plane (discovery).** The client calls the router's candidate API (model
 + constraints — no body). The router returns an **ordered candidate list**; for
@@ -122,7 +120,7 @@ router that returns a bogus or swapped quote is caught, not trusted.
 **Client obligations before sealing.** For the candidate it pins, the client
 MUST:
 1. Verify the quote — genuine TDX + expected measurement (trust model in
-   `docs/design/router-e2e.md`).
+   `../docs/design/router-e2e.md`).
 2. Extract `enc_pub` + `signer_addr` from `report_data`, check `version`.
 3. Confirm `signer_addr` equals the provider's on-chain `teeSignerAddress`.
 
@@ -250,8 +248,8 @@ sequence increments per `Seal`, so frames MUST be opened in order).
 (resp_enc, resp_ctx) = HPKE.SetupBaseS(client_eph_pub, info="0g-pc/v1/resp")
 // per frame, in order:
 sealed_obj = { field: value  for field in sealed_fields }   // e.g. { "choices": [...] }
-aad        = JCS(frame_json without _e2ee.ct)
-ct         = resp_ctx.Seal(aad, JCS(sealed_obj))
+aad        = JCS(frame_json without _e2ee.ciphertext)
+ciphertext = resp_ctx.Seal(aad, JCS(sealed_obj))
 ```
 
 **Non-streaming** — the response body is one frame:
@@ -266,7 +264,7 @@ ct         = resp_ctx.Seal(aad, JCS(sealed_obj))
     "enc": "<base64url resp_enc>",
     "sealed_fields": ["choices"],
     "final": true,
-    "ct": "<base64url>"
+    "ciphertext": "<base64url>"
   }
 }
 ```
@@ -275,9 +273,9 @@ ct         = resp_ctx.Seal(aad, JCS(sealed_obj))
 final (per `stream_options.include_usage`); each event seals that chunk's
 `choices` delta:
 ```
-data: {"model":"gpt-4o","_e2ee":{"v":1,"enc":"<resp_enc>","sealed_fields":["choices"],"final":false,"ct":"<...>"}}
-data: {"model":"gpt-4o","_e2ee":{"sealed_fields":["choices"],"final":false,"ct":"<...>"}}
-data: {"usage":{...},"_e2ee":{"sealed_fields":["choices"],"final":true,"ct":"<...>"}}
+data: {"model":"gpt-4o","_e2ee":{"v":1,"enc":"<resp_enc>","sealed_fields":["choices"],"final":false,"ciphertext":"<...>"}}
+data: {"model":"gpt-4o","_e2ee":{"sealed_fields":["choices"],"final":false,"ciphertext":"<...>"}}
+data: {"usage":{...},"_e2ee":{"sealed_fields":["choices"],"final":true,"ciphertext":"<...>"}}
 ```
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
@@ -336,7 +334,6 @@ separately.
 Out of scope for v1 (tracked):
 
 - Candidate scoring algorithm (§4.4; specified separately).
-- Approach B (router-in-TEE that decrypts and re-selects).
 - A "strict" client mode that seals unknown fields **by default** (inverts the
   §5.1 trade-off for high-privacy users).
 - Sender-authenticated HPKE / PSK modes.

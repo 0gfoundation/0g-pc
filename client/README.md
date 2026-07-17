@@ -5,7 +5,7 @@ inference on the 0G Compute Network. It lets you verify that a response really
 came from an attested TEE provider, and — on the router path — keep your prompt
 unreadable to everything between you and the provider enclave.
 
-> Status: early / design-stage. The design lives in [`docs/design`](docs/design)
+> Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
 > (see `router-e2e.md`). Interfaces will change.
 
 ## One core, three forms
@@ -35,8 +35,10 @@ cmd/
 sdk/
   go/            # in-process Go SDK (thin wrapper over core)
   ts/            # (planned) TS / WASM build for the browser
-docs/design/     # design docs (router-e2e.md, architecture.md)
 ```
+
+Design docs live at the repo root under
+[`docs/design`](../docs/design) (currently `router-e2e.md`).
 
 Depends on **`github.com/0gfoundation/0g-pc/protocol`** — the shared wire
 format, verification/sealing crypto, and route-scoring logic used by the broker,
@@ -69,9 +71,10 @@ provider enclave.
   signer matches the on-chain `teeSignerAddress`.
 - **Routing / confidentiality** — on the router path, the sensitive request
   fields (prompt, tool defs) are sealed to the provider enclave; the router reads
-  only the cleartext routing params (model, sampling, usage), not your prompt.
+  only the cleartext fields — routing params (model, sampling) and billing
+  (`usage`, on the response) — not your prompt.
 
-See [`docs/design/router-e2e.md`](docs/design/router-e2e.md) for the full trust
+See [`docs/design/router-e2e.md`](../docs/design/router-e2e.md) for the full trust
 model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
 ## Related repositories & products
