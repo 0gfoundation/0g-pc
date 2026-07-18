@@ -41,12 +41,12 @@ const (
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
 var b64 = base64.RawURLEncoding
 
-// defaultSealedFields is the v1 default set of request fields to seal (SPEC
-// §5.1). It returns a fresh slice, so a caller may append additional sensitive
-// fields (e.g. "metadata", "user") without mutating the shared default. The
-// default lives here in exactly one place. Kept unexported until a real caller
-// (the client) needs it — export then.
-func defaultSealedFields() []string {
+// DefaultSealedFields is the v1 default set of request fields to seal (SPEC
+// §5.1). It returns a fresh slice, so a caller may filter it to the fields
+// actually present or append additional sensitive ones (e.g. "metadata",
+// "user") without mutating the shared default. The default lives here in
+// exactly one place; clients reference it rather than re-listing the names.
+func DefaultSealedFields() []string {
 	return []string{"messages", "tools"}
 }
 
@@ -107,7 +107,7 @@ type Request map[string]json.RawMessage
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte) (Request, error) {
 	if sealedFields == nil {
-		sealedFields = defaultSealedFields()
+		sealedFields = DefaultSealedFields()
 	}
 	if err := validateSealedFields(sealedFields); err != nil {
 		return nil, err
