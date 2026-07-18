@@ -158,6 +158,29 @@ func TestResponseTamperedCleartextFailsOpen(t *testing.T) {
 	}
 }
 
+func TestResponseFinalFlipFailsOpen(t *testing.T) {
+	priv, pub := clientEph(t)
+	env, err := wire.SealResponse(pub, mustResp(t, sampleResp), nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// `final` lives in _e2ee and is bound in the AAD; flipping it (e.g. a router
+	// trying to make a complete response look like it has more frames coming, or
+	// vice versa) must break Open.
+	e2ee, err := env.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	if !e2ee.Final {
+		t.Fatal("precondition: single-frame response should be final")
+	}
+	e2ee.Final = false
+	env["_e2ee"], _ = json.Marshal(e2ee)
+	if _, err := wire.OpenResponse(priv, env); err == nil {
+		t.Fatal("expected Open to fail after flipping final, got nil")
+	}
+}
+
 func TestResponseWrongClientKeyFailsOpen(t *testing.T) {
 	_, pub := clientEph(t)
 	wrongPriv, _ := clientEph(t)

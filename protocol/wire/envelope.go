@@ -33,6 +33,9 @@ const (
 	e2eeKey = "_e2ee"
 	// fieldMessages is the sensitive field that MUST always be sealed.
 	fieldMessages = "messages"
+	// clientEphPubLen is the byte length of an X25519 public key — the client's
+	// response ephemeral key (SPEC §3 suite).
+	clientEphPubLen = 32
 )
 
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
@@ -108,6 +111,15 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 	}
 	if err := validateSealedFields(sealedFields); err != nil {
 		return nil, err
+	}
+	if !isProviderID(providerID) {
+		return nil, fmt.Errorf("invalid provider_id %q (want 0x followed by 40 hex)", providerID)
+	}
+	// clientEphPub is stored, not used, at seal time — the enclave seals the
+	// response to it (§7). Reject a malformed key here rather than emit an
+	// envelope whose response can never be opened.
+	if len(clientEphPub) != clientEphPubLen {
+		return nil, fmt.Errorf("client_eph_pub must be %d bytes (X25519), got %d", clientEphPubLen, len(clientEphPub))
 	}
 
 	// 1. sealed_obj = { field: original value } for each sealed field.
@@ -302,6 +314,24 @@ func canonicalJSON(v any) ([]byte, error) {
 func keyID(encPub crypto.PublicKey) []byte {
 	h := sha256.Sum256(encPub)
 	return h[:8]
+}
+
+// isProviderID reports whether s is a 0x-prefixed 20-byte hex address — the
+// on-chain signer address format (§4.2). Case-insensitive on the hex body; the
+// checksum (EIP-55) is not verified here.
+func isProviderID(s string) bool {
+	if len(s) != 42 || s[0] != '0' || s[1] != 'x' {
+		return false
+	}
+	for i := 2; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func toSet(ss []string) map[string]struct{} {
