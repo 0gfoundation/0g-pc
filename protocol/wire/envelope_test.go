@@ -169,6 +169,33 @@ func TestSealRequestRejectsMissingSealedField(t *testing.T) {
 	}
 }
 
+func TestSealRequestRejectsWithoutMessages(t *testing.T) {
+	_, pub, _ := crypto.GenerateRecipientKey()
+	req := mustReq(t, `{"model":"gpt-4o","messages":[],"tools":[]}`)
+	// Sealing tools but leaving the prompt cleartext defeats the purpose.
+	if _, err := wire.SealRequest(pub, req, []string{"tools"}, "0xabc", nil); err == nil {
+		t.Fatal("expected error when messages is not sealed, got nil")
+	}
+}
+
+func TestSealRequestNilUsesDefaultSet(t *testing.T) {
+	priv, pub, _ := crypto.GenerateRecipientKey()
+	env, err := wire.SealRequest(pub, mustReq(t, sampleReq), nil, "0xabc", nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	e2ee, err := env.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools"}) {
+		t.Fatalf("nil sealedFields should use the default set, got %v", e2ee.SealedFields)
+	}
+	if _, err := wire.OpenRequest(priv, env); err != nil {
+		t.Fatalf("open after default-set seal: %v", err)
+	}
+}
+
 // sameJSONObject compares two field maps by normalizing through JSON so number
 // and formatting differences (e.g. JCS canonicalization) don't matter.
 func sameJSONObject(t *testing.T, a, b wire.Request) bool {

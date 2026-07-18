@@ -27,10 +27,51 @@ const (
 	SealInfo = "0g-pc/v1/seal"
 	// e2eeKey is the reserved top-level key that holds the sealing metadata.
 	e2eeKey = "_e2ee"
+	// fieldMessages is the sensitive field that MUST always be sealed.
+	fieldMessages = "messages"
 )
 
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
 var b64 = base64.RawURLEncoding
+
+// defaultSealedFields is the v1 default set of request fields to seal (SPEC
+// §5.1). It returns a fresh slice, so a caller may append additional sensitive
+// fields (e.g. "metadata", "user") without mutating the shared default. The
+// default lives here in exactly one place. Kept unexported until a real caller
+// (the client) needs it — export then.
+func defaultSealedFields() []string {
+	return []string{"messages", "tools"}
+}
+
+// validateSealedFields enforces the invariants on a sealed-field set: non-empty,
+// no duplicates, and "messages" present. Leaving the prompt cleartext defeats
+// the purpose, so any sealed envelope MUST cover "messages".
+//
+// SealRequest calls this fail-closed, so the client cannot build an envelope
+// that silently leaves the prompt exposed — the only place a leak can actually
+// be *prevented*. A broker-side defense-in-depth check on open would be a
+// fail-loud backstop (the cleartext has already traversed the router by then),
+// not prevention; export this for that use if/when the broker needs it.
+func validateSealedFields(fields []string) error {
+	if len(fields) == 0 {
+		return fmt.Errorf("no sealed fields")
+	}
+	seen := make(map[string]struct{}, len(fields))
+	hasMessages := false
+	for _, f := range fields {
+		if _, dup := seen[f]; dup {
+			return fmt.Errorf("duplicate sealed field %q", f)
+		}
+		seen[f] = struct{}{}
+		if f == fieldMessages {
+			hasMessages = true
+		}
+	}
+	if !hasMessages {
+		return fmt.Errorf("sealed fields must include %q", fieldMessages)
+	}
+	return nil
+}
 
 // E2EE is the sealing-metadata object added to the request under `_e2ee` (§5).
 type E2EE struct {
@@ -53,12 +94,16 @@ type Request map[string]json.RawMessage
 // cleartext fields plus the `_e2ee` object.
 //
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
-//   - sealedFields: fields to seal, e.g. ["messages","tools"]; each MUST be in req
+//   - sealedFields: fields to seal; nil uses the v1 default (messages, tools).
+//     "messages" is required and each field MUST be present in req.
 //   - providerID:   the pinned provider's on-chain signer address ("0x…")
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte) (Request, error) {
-	if len(sealedFields) == 0 {
-		return nil, fmt.Errorf("no sealed fields")
+	if sealedFields == nil {
+		sealedFields = defaultSealedFields()
+	}
+	if err := validateSealedFields(sealedFields); err != nil {
+		return nil, err
 	}
 
 	// 1. sealed_obj = { field: original value } for each sealed field.
