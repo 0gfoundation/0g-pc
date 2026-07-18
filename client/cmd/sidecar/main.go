@@ -10,6 +10,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -61,10 +62,14 @@ func newHandler(c *core.Client) http.Handler {
 			writeError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
+		if isStreaming(req) {
+			// Fail loud: a streaming client must not receive a non-SSE body.
+			writeError(w, http.StatusNotImplemented, "streaming (stream: true) is not yet supported")
+			return
+		}
 		resp, err := c.Complete(r.Context(), req)
 		if err != nil {
-			// Seal/transport/open failure — upstream-facing, so 502.
-			writeError(w, http.StatusBadGateway, err.Error())
+			writeError(w, statusFor(err), err.Error())
 			return
 		}
 		out, err := json.Marshal(resp)
@@ -76,6 +81,32 @@ func newHandler(c *core.Client) http.Handler {
 		_, _ = w.Write(out)
 	})
 	return mux
+}
+
+// isStreaming reports whether the request asked for a streamed (SSE) response.
+func isStreaming(req wire.Request) bool {
+	raw, ok := req["stream"]
+	if !ok {
+		return false
+	}
+	var stream bool
+	return json.Unmarshal(raw, &stream) == nil && stream
+}
+
+// statusFor maps a Complete failure to an HTTP status by its stage: a bad client
+// request is 400, a client-side internal error is 500, and anything upstream (or
+// unclassified) is 502.
+func statusFor(err error) int {
+	var e *core.Error
+	if errors.As(err, &e) {
+		switch e.Stage {
+		case core.StageRequest:
+			return http.StatusBadRequest
+		case core.StageInternal:
+			return http.StatusInternalServerError
+		}
+	}
+	return http.StatusBadGateway
 }
 
 // writeError emits an OpenAI-shaped error object.

@@ -7,10 +7,36 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/0gfoundation/0g-pc/protocol/crypto"
 	"github.com/0gfoundation/0g-pc/protocol/wire"
 )
+
+// defaultTimeout bounds a whole request/response to the provider. Chat
+// completions can be slow, so it is generous; callers that need a different
+// bound can pass their own context deadline.
+const defaultTimeout = 120 * time.Second
+
+// Stage names where a Complete call failed, so callers (the sidecar) can map it
+// to an HTTP status: a bad client request vs an upstream/provider failure vs a
+// client-side internal error.
+const (
+	StageRequest  = "request"  // invalid client request (seal-side)
+	StageUpstream = "upstream" // provider transport or sealed-response failure
+	StageInternal = "internal" // client-side internal error
+)
+
+// Error wraps a Complete failure with the Stage it happened at.
+type Error struct {
+	Stage string
+	Err   error
+}
+
+func (e *Error) Error() string { return e.Err.Error() }
+func (e *Error) Unwrap() error { return e.Err }
+
+func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
 
 // Provider identifies the enclave the client seals to. In production EncPubKey
 // and SignerAddr are extracted from a verified attestation quote; here they are
@@ -24,46 +50,48 @@ type Provider struct {
 // Client is the shared client core: it seals a request's sensitive fields to
 // the provider, sends the envelope, and opens the sealed response. It holds no
 // server of its own — the sidecar, the cloud-TEE gateway, and the in-process
-// SDK all wrap this.
+// SDK all wrap this. A Client is safe for concurrent use.
 type Client struct {
 	provider Provider
 	http     *http.Client
 }
 
-// New returns a Client for the given provider, using http.DefaultClient.
+// New returns a Client for the given provider.
 func New(p Provider) *Client {
-	return &Client{provider: p, http: http.DefaultClient}
+	return &Client{provider: p, http: &http.Client{Timeout: defaultTimeout}}
 }
 
 // Complete performs one non-streaming chat completion. req and the result are
 // OpenAI-shaped JSON objects; the sensitive fields are sealed on the way out and
 // the sealed response is opened on the way back, so the caller only ever handles
-// plaintext.
+// plaintext. Failures are wrapped in *Error with a Stage.
 func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response, error) {
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
 	// public half (§7) and we keep the private half to open it.
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
-		return nil, fmt.Errorf("generate ephemeral key: %w", err)
+		return nil, stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
 	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
 	if err != nil {
-		return nil, fmt.Errorf("seal request: %w", err)
+		// Given a valid provider config (validated at startup), a seal failure is
+		// a bad request — e.g. no messages to seal.
+		return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
 	respBody, err := c.post(ctx, sealed)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StageUpstream, err)
 	}
 
 	var sealedResp wire.Response
 	if err := json.Unmarshal(respBody, &sealedResp); err != nil {
-		return nil, fmt.Errorf("decode sealed response: %w", err)
+		return nil, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
 	out, err := wire.OpenResponse(ephPriv, sealedResp)
 	if err != nil {
-		return nil, fmt.Errorf("open response: %w", err)
+		return nil, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
 	}
 	return out, nil
 }

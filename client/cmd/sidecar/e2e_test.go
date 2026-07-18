@@ -152,7 +152,53 @@ func TestSidecarSurfacesTamper(t *testing.T) {
 		t.Fatalf("post to sidecar: %v", err)
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode == http.StatusOK {
-		t.Fatal("tampered request should not have produced a 200")
+	// An open failure downstream is an upstream-stage error → 502.
+	if httpResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("tampered request: got %d, want 502", httpResp.StatusCode)
+	}
+}
+
+// stream:true must be rejected loudly (501) rather than answered with a non-SSE
+// body a streaming client cannot parse.
+func TestSidecarRejectsStreaming(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+	broker := mockBroker(t, encPriv, signer)
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("stream:true: got %d, want 501", httpResp.StatusCode)
+	}
+}
+
+// A request with nothing to seal (no messages) is a client error → 400, not 502.
+func TestSidecarBadRequestIs400(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("d", 40)
+	broker := mockBroker(t, encPriv, signer)
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o"}` // no messages
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("request with no messages: got %d, want 400", httpResp.StatusCode)
 	}
 }
