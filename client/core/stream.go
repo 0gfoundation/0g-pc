@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/0gfoundation/0g-pc/protocol/crypto"
 	"github.com/0gfoundation/0g-pc/protocol/wire"
@@ -15,6 +17,11 @@ import (
 // maxSSELine caps a single SSE data line read from the provider (one sealed
 // frame), guarding against an unbounded line.
 const maxSSELine = 4 << 20 // 4 MiB
+
+// streamIdleTimeout aborts a stream that stalls (no new frame) for this long, so
+// a provider that connects then hangs mid-stream cannot hold the call open
+// indefinitely.
+const streamIdleTimeout = 60 * time.Second
 
 // CompleteStream performs a streaming chat completion. It seals req, sends it,
 // then reads the provider's SSE stream of sealed frames, opens each in order,
@@ -27,6 +34,11 @@ const maxSSELine = 4 << 20 // 4 MiB
 // The same response-authenticity caveat as Complete applies (see its doc): the
 // frames are confidential but their origin is not yet authenticated.
 func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame func(wire.Response) error) error {
+	// Cancellable so the idle watchdog (and a parent-context cancel) can abort a
+	// blocked read on the provider stream.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		return stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
@@ -46,15 +58,29 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
 		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d: %s", resp.StatusCode, body)}
 	}
+	// A 200 that is not an event stream (a provider that ignored stream:true)
+	// would be read as zero frames and silently yield an empty stream; fail loud.
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
+		return stageErr(StageUpstream, fmt.Errorf("provider did not stream (content-type %q): %s", ct, body))
+	}
+
+	// Abort if the provider stalls between frames.
+	idle := time.AfterFunc(streamIdleTimeout, cancel)
+	defer idle.Stop()
 
 	sse := newSSEReader(resp.Body)
 	var opener *wire.ResponseOpener
 	for {
+		idle.Reset(streamIdleTimeout) // re-arm for the next read
 		data, err := sse.next()
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				return stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
+			}
 			return stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
 		}
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {

@@ -172,7 +172,7 @@ func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wir
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // ask a fronting proxy (nginx) not to buffer
 		w.WriteHeader(http.StatusOK)
 		wroteHeader = true
 	}

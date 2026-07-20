@@ -352,6 +352,59 @@ func TestSidecarSealsConfiguredExtraField(t *testing.T) {
 	}
 }
 
+// A streaming request that hits an upstream non-2xx gets that status verbatim
+// (a normal error response, not SSE), since it fails before any frame is sent.
+func TestSidecarStreamingUpstreamStatus(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want 429 (upstream status passed through)", httpResp.StatusCode)
+	}
+}
+
+// A provider that returns a non-SSE 200 for a stream request (ignored
+// stream:true) fails loud (502) rather than yielding a silent empty stream.
+func TestSidecarStreamingNonSSEUpstream(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"not":"a stream"}`))
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("got %d, want 502 (non-SSE upstream)", httpResp.StatusCode)
+	}
+}
+
 // A malformed "stream" value (a string, not a bool) is a client error → 400,
 // not silently treated as non-streaming.
 func TestSidecarRejectsMalformedStream(t *testing.T) {
