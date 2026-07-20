@@ -96,8 +96,8 @@ func New(p Provider, opts ...Option) *Client {
 		p.URL = DefaultProviderURL
 	}
 	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
-	// bound the wait for response headers. No blunt http.Client.Timeout: it would
-	// also cut a long stream (see defaultTimeout / responseHeaderTimeout).
+	// bound the wait for response headers via ResponseHeaderTimeout. No blunt
+	// http.Client.Timeout: it would also cut a long stream (see providerTimeout).
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
