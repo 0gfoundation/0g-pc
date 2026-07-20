@@ -41,25 +41,25 @@ const (
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
 var b64 = base64.RawURLEncoding
 
-// defaultSealedFields is the v1 default set of request fields to seal (SPEC
-// §5.1). It returns a fresh slice, so a caller may append additional sensitive
-// fields (e.g. "metadata", "user") without mutating the shared default. The
-// default lives here in exactly one place. Kept unexported until a real caller
-// (the client) needs it — export then.
-func defaultSealedFields() []string {
+// DefaultSealedFields is the v1 default set of request fields to seal (SPEC
+// §5.1). It returns a fresh slice, so a caller may filter it to the fields
+// actually present or append additional sensitive ones (e.g. "metadata",
+// "user") without mutating the shared default. The default lives here in
+// exactly one place; clients reference it rather than re-listing the names.
+func DefaultSealedFields() []string {
 	return []string{"messages", "tools"}
 }
 
-// validateSealedFields enforces the invariants on a sealed-field set: non-empty,
+// ValidateSealedFields enforces the invariants on a sealed-field set: non-empty,
 // no duplicates, and "messages" present. Leaving the prompt cleartext defeats
 // the purpose, so any sealed envelope MUST cover "messages".
 //
-// SealRequest calls this fail-closed, so the client cannot build an envelope
-// that silently leaves the prompt exposed — the only place a leak can actually
-// be *prevented*. A broker-side defense-in-depth check on open would be a
-// fail-loud backstop (the cleartext has already traversed the router by then),
-// not prevention; export this for that use if/when the broker needs it.
-func validateSealedFields(fields []string) error {
+// SealRequest calls this fail-closed per request, so a client cannot build an
+// envelope that silently leaves the prompt exposed — the only place a leak can
+// actually be *prevented*. It is also exported so a caller can validate an
+// operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
+// and fail fast instead of erroring on every request.
+func ValidateSealedFields(fields []string) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
 	}
@@ -107,9 +107,9 @@ type Request map[string]json.RawMessage
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte) (Request, error) {
 	if sealedFields == nil {
-		sealedFields = defaultSealedFields()
+		sealedFields = DefaultSealedFields()
 	}
-	if err := validateSealedFields(sealedFields); err != nil {
+	if err := ValidateSealedFields(sealedFields); err != nil {
 		return nil, err
 	}
 	if !isProviderID(providerID) {

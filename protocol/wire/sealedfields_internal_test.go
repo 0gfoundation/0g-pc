@@ -16,23 +16,23 @@ func TestValidateSealedFields(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateSealedFields(c.fields)
+			err := ValidateSealedFields(c.fields)
 			if (err != nil) != c.wantErr {
-				t.Fatalf("validateSealedFields(%v) err = %v, wantErr %v", c.fields, err, c.wantErr)
+				t.Fatalf("ValidateSealedFields(%v) err = %v, wantErr %v", c.fields, err, c.wantErr)
 			}
 		})
 	}
 }
 
 func TestDefaultSealedFieldsIsValidAndFresh(t *testing.T) {
-	if err := validateSealedFields(defaultSealedFields()); err != nil {
+	if err := ValidateSealedFields(DefaultSealedFields()); err != nil {
 		t.Fatalf("default set fails validation: %v", err)
 	}
 	// Returns a fresh slice each call, so mutating one result cannot corrupt the
 	// shared default.
-	a := defaultSealedFields()
+	a := DefaultSealedFields()
 	a[0] = "tampered"
-	if b := defaultSealedFields(); b[0] != "messages" {
+	if b := DefaultSealedFields(); b[0] != "messages" {
 		t.Fatalf("default set was mutated across calls: %v", b)
 	}
 }
