@@ -50,16 +50,16 @@ func DefaultSealedFields() []string {
 	return []string{"messages", "tools"}
 }
 
-// validateSealedFields enforces the invariants on a sealed-field set: non-empty,
+// ValidateSealedFields enforces the invariants on a sealed-field set: non-empty,
 // no duplicates, and "messages" present. Leaving the prompt cleartext defeats
 // the purpose, so any sealed envelope MUST cover "messages".
 //
-// SealRequest calls this fail-closed, so the client cannot build an envelope
-// that silently leaves the prompt exposed — the only place a leak can actually
-// be *prevented*. A broker-side defense-in-depth check on open would be a
-// fail-loud backstop (the cleartext has already traversed the router by then),
-// not prevention; export this for that use if/when the broker needs it.
-func validateSealedFields(fields []string) error {
+// SealRequest calls this fail-closed per request, so a client cannot build an
+// envelope that silently leaves the prompt exposed — the only place a leak can
+// actually be *prevented*. It is also exported so a caller can validate an
+// operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
+// and fail fast instead of erroring on every request.
+func ValidateSealedFields(fields []string) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
 	}
@@ -109,7 +109,7 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 	if sealedFields == nil {
 		sealedFields = DefaultSealedFields()
 	}
-	if err := validateSealedFields(sealedFields); err != nil {
+	if err := ValidateSealedFields(sealedFields); err != nil {
 		return nil, err
 	}
 	if !isProviderID(providerID) {

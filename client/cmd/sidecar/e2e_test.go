@@ -181,6 +181,63 @@ func TestSidecarRejectsStreaming(t *testing.T) {
 	}
 }
 
+// WithSealFields lets the operator seal an extra field (here "metadata"); it
+// must reach the broker sealed, not in cleartext, and be recovered on open.
+func TestSidecarSealsConfiguredExtraField(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, leaked := env["metadata"]; leaked {
+			t.Error("metadata reached the broker in cleartext")
+			http.Error(w, "metadata not sealed", http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		req, err := wire.OpenRequest(encPriv, env)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !bytes.Contains(req["metadata"], []byte("trace-42")) {
+			http.Error(w, "metadata not recovered", http.StatusInternalServerError)
+			return
+		}
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-mock"`),
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
+	}))
+	defer broker.Close()
+
+	client := core.New(
+		core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer},
+		core.WithSealFields([]string{"messages", "metadata"}),
+	)
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"metadata":{"trace":"trace-42"}}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(httpResp.Body)
+		t.Fatalf("got %d: %s", httpResp.StatusCode, b)
+	}
+}
+
 // A malformed "stream" value (a string, not a bool) is a client error → 400,
 // not silently treated as non-streaming.
 func TestSidecarRejectsMalformedStream(t *testing.T) {

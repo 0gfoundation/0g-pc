@@ -57,17 +57,37 @@ type Provider struct {
 // server of its own — the sidecar, the cloud-TEE gateway, and the in-process
 // SDK all wrap this. A Client is safe for concurrent use.
 type Client struct {
-	provider Provider
-	http     *http.Client
+	provider   Provider
+	sealFields []string
+	http       *http.Client
+}
+
+// Option customizes a Client.
+type Option func(*Client)
+
+// WithSealFields overrides the set of request fields the client seals. Each is
+// sealed only when present in a given request. The set must satisfy
+// wire.ValidateSealedFields (non-empty, no duplicates, includes "messages");
+// validate it before passing it in for a clear up-front error.
+func WithSealFields(fields []string) Option {
+	return func(c *Client) { c.sealFields = fields }
 }
 
 // New returns a Client for the given provider. An empty Provider.URL defaults to
-// DefaultProviderURL.
-func New(p Provider) *Client {
+// DefaultProviderURL; the sealed-field set defaults to wire.DefaultSealedFields.
+func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
 		p.URL = DefaultProviderURL
 	}
-	return &Client{provider: p, http: &http.Client{Timeout: defaultTimeout}}
+	c := &Client{
+		provider:   p,
+		sealFields: wire.DefaultSealedFields(),
+		http:       &http.Client{Timeout: defaultTimeout},
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
 }
 
 // Complete performs one non-streaming chat completion. req and the result are
@@ -90,7 +110,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
+	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, c.sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
 	if err != nil {
 		// Given a valid provider config (validated at startup), a seal failure is
 		// a bad request — e.g. no messages to seal.
@@ -140,18 +160,17 @@ func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, error) {
 	return respBody, nil
 }
 
-// sealedFieldsFor picks the default sensitive fields that are actually present
-// in req. A valid chat request always carries "messages"; "tools" often is
-// absent. Filtering by presence seals the prompt (and the tool definitions when
-// sent) without erroring on a tools-less request, while keeping the default set
-// defined in exactly one place (wire.DefaultSealedFields).
-func sealedFieldsFor(req wire.Request) []string {
+// sealedFieldsFor picks the configured sealed fields that are actually present
+// in req. A valid chat request always carries "messages"; "tools" (and any
+// operator-added field) often is absent. Filtering by presence seals what is
+// sent without erroring on a request that omits an optional sealed field.
+func (c *Client) sealedFieldsFor(req wire.Request) []string {
 	// Non-nil even when empty: SealRequest treats a nil sealedFields as "use the
 	// default set", which would silently mask this presence-filter. An empty
 	// (non-nil) result instead makes SealRequest fail with "no sealed fields" —
 	// the right outcome for a request with nothing sensitive to seal.
 	fs := []string{}
-	for _, f := range wire.DefaultSealedFields() {
+	for _, f := range c.sealFields {
 		if _, ok := req[f]; ok {
 			fs = append(fs, f)
 		}

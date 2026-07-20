@@ -16,6 +16,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc/client/core"
@@ -31,6 +32,7 @@ func main() {
 	providerURL := flag.String("provider-url", core.DefaultProviderURL, "provider (router/broker) OpenAI chat-completions endpoint")
 	encPubB64 := flag.String("provider-enc-key", "", "provider HPKE public key, base64url (attestation stub)")
 	signer := flag.String("provider-signer", "", "provider on-chain signer address (0x...)")
+	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
 
 	if *encPubB64 == "" || *signer == "" {
@@ -40,12 +42,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("bad provider-enc-key: %v", err)
 	}
+	sealFields := parseCSV(*sealFieldsCSV)
+	if err := wire.ValidateSealedFields(sealFields); err != nil {
+		log.Fatalf("invalid -seal-fields: %v", err)
+	}
 
 	client := core.New(core.Provider{
 		URL:        *providerURL,
 		EncPubKey:  crypto.PublicKey(encPub),
 		SignerAddr: *signer,
-	})
+	}, core.WithSealFields(sealFields))
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           newHandler(client),
@@ -101,6 +107,17 @@ func newHandler(c *core.Client) http.Handler {
 		_, _ = w.Write(out)
 	})
 	return mux
+}
+
+// parseCSV splits a comma-separated flag value into trimmed, non-empty parts.
+func parseCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // streamRequested reports whether the request asked for a streamed (SSE)
