@@ -352,6 +352,72 @@ func TestSidecarSealsConfiguredExtraField(t *testing.T) {
 	}
 }
 
+// A stream that ends without a final frame (provider crash / dropped connection)
+// must be surfaced as an error, not silently completed with [DONE]. The
+// mid-stream error event must itself be valid JSON.
+func TestSidecarStreamingTruncated(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		sealer, _ := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+		frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"par"}}]`)}
+		sealed, _ := sealer.SealFrame(frame, nil, false) // NOT final
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		b, _ := json.Marshal(sealed)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+		// Return without a final frame or [DONE] — a truncated stream.
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	raw, _ := io.ReadAll(httpResp.Body)
+
+	if strings.Contains(string(raw), "[DONE]") {
+		t.Fatal("a truncated stream must not be completed with [DONE]")
+	}
+	sawError := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || !strings.Contains(payload, "error") {
+			continue
+		}
+		var v map[string]any
+		if err := json.Unmarshal([]byte(payload), &v); err != nil {
+			t.Fatalf("error event is not valid JSON: %q", payload)
+		}
+		sawError = true
+	}
+	if !sawError {
+		t.Fatal("truncated stream did not surface an error event")
+	}
+}
+
 // A streaming request that hits an upstream non-2xx gets that status verbatim
 // (a normal error response, not SSE), since it fails before any frame is sent.
 func TestSidecarStreamingUpstreamStatus(t *testing.T) {

@@ -195,8 +195,10 @@ func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wir
 			writeError(w, statusFor(err), err.Error())
 			return
 		}
-		// Mid-stream: surface as a final SSE error event, then stop.
-		fmt.Fprintf(w, "data: {\"error\":{\"message\":%q}}\n\n", err.Error())
+		// Mid-stream: surface as a final SSE error event, then stop. Build the
+		// payload with json.Marshal — %q is not JSON-safe for arbitrary bytes.
+		errEvent, _ := json.Marshal(map[string]any{"error": map[string]string{"message": err.Error()}})
+		fmt.Fprintf(w, "data: %s\n\n", errEvent)
 		flusher.Flush()
 		return
 	}

@@ -71,10 +71,17 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 
 	sse := newSSEReader(resp.Body)
 	var opener *wire.ResponseOpener
+	sawFinal := false
 	for {
-		idle.Reset(streamIdleTimeout) // re-arm for the next read
+		idle.Reset(streamIdleTimeout) // time only the provider read...
 		data, err := sse.next()
+		idle.Stop() // ...not the onFrame write (a slow client is not a provider stall)
 		if err == io.EOF {
+			// A stream that ends without its final frame was truncated (provider
+			// crash / dropped connection) — not a complete answer.
+			if !sawFinal {
+				return stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
+			}
 			return nil
 		}
 		if err != nil {
@@ -84,12 +91,19 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			return stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
 		}
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+			if !sawFinal {
+				return stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
+			}
 			return nil
 		}
 
 		var frame wire.Response
 		if err := json.Unmarshal(data, &frame); err != nil {
 			return stageErr(StageUpstream, fmt.Errorf("decode stream frame: %w", err))
+		}
+		fe, err := frame.E2EE()
+		if err != nil {
+			return stageErr(StageUpstream, fmt.Errorf("read frame metadata: %w", err))
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
@@ -104,6 +118,9 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		}
 		if err := onFrame(out); err != nil {
 			return err
+		}
+		if fe.Final {
+			sawFinal = true
 		}
 	}
 }
