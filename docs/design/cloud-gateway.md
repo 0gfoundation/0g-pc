@@ -76,12 +76,31 @@ extra step trusts by default. Market it as *verifiable / auditable*, never as
 
 ## 5. Data plane (inference) — details
 
-### 5.1 The gateway is the sidecar's client core, wrapped as a server
+### 5.1 The gateway *is* the sidecar, in a TEE — not a new server
 
-The gateway reuses `client/core` (`Client.Complete` / `CompleteStream`): pick +
-verify a provider, seal the sensitive fields to it, open the sealed response.
-The new part is the **server shell** in front of the core, which accepts the
-browser's request and streams the plaintext answer back.
+In the 0-client-code model the browser sends **plaintext over TLS** and gets
+plaintext back, so the gateway's client-facing side is **identical to the
+sidecar's** (plaintext OpenAI in/out), and the only sealed hop is
+gateway→provider — which is `client/core` verbatim. The gateway therefore needs
+**no new server wrapper and no browser-facing sealing**; it reuses the sidecar's
+HTTP handler.
+
+**Structure.** Extract the sidecar's OpenAI-compatible HTTP handler (today in
+`cmd/sidecar`'s `package main`) into a shared, importable package (e.g.
+`client/openaiproxy`); `cmd/sidecar` and `cmd/gateway` both mount it. The gateway
+adds only what the sidecar lacks:
+
+- **attestation** — derive the enclave enc/signing keys and expose the quote API
+  (§6);
+- **multi-tenant concerns** — auth, per-user billing attribution, rate limiting,
+  abuse handling, and logging that never records plaintext (the sidecar is
+  single-user and needs none of these);
+- **dstack packaging** — TLS-in-enclave + fleet, mostly runtime not app code (§7).
+
+> Browser-facing **sealing** (the gateway unsealing a request the browser
+> app-layer-sealed to it) is a **tier-3-only** concern — a browser running our
+> WASM SDK. The 0-client-code path here has none: the browser is plaintext over
+> TLS, so that "double seal" does not apply.
 
 ### 5.2 What sees plaintext
 
@@ -110,9 +129,11 @@ dstack provides this as a managed feature — see §7.
 
 ### 5.4 Response direction
 
-Symmetric with the request: the provider seals the response to a gateway-held
-key; the gateway opens it and streams plaintext back to the browser over the
-in-enclave TLS. (Reuses the response envelope, SPEC §7.)
+Only the gateway→provider hop is sealed. The provider seals the response to a
+gateway-held key; the gateway opens it (SPEC §7, reusing `client/core`) and
+streams **plaintext** back to the browser over the in-enclave TLS. In the
+0-client-code model the gateway does **not** re-seal to the browser (there is no
+browser-side key) — re-sealing to the client is the tier-3 (WASM SDK) path only.
 
 ## 6. Validation plane — details
 
@@ -131,6 +152,14 @@ controlled only by that enclave?"**
    chain, and rely on **Certificate Transparency** for the cert itself.
 4. **Continuous monitoring** (ideally run by 0G and/or a third party), so the
    guarantee is not left solely to end users.
+5. **Per-request response signature** (like the broker's, SPEC §8): the gateway
+   signs each response with its enclave key. A plain browser **cannot verify it
+   live** — verifying a signature is crypto, i.e. client code — but the signature
+   makes each response **individually auditable out of band** (verify later, by a
+   tool / extension / monitor) and is **forward-compatible**: a client that later
+   runs a little code verifies the *same* signature live (tier 3). It only
+   *complements* — does not replace — the one-time attestation that vouches for
+   the signing key (broker model = attest the key once + sign every response).
 
 ### 6.2 What it proves / does not prove
 
@@ -141,9 +170,16 @@ controlled only by that enclave?"**
 - **Does not prove**: that *this specific browser request* went to that enclave.
   A plain browser only checks WebPKI, so the binding between "what the auditor
   validated" and "what the user connected to" is **detected, not enforced**.
+- **On per-request signatures**: a *gateway* signature attests "the attested
+  gateway enclave handled this response", not "the inference is genuine" — the
+  gateway relays, it does not run the model. For inference authenticity, carry
+  the *broker's* signature (SPEC §8) through to the client. Verifying either is
+  client code, so for a 0-code browser both are out-of-band / after-the-fact
+  artifacts, not live checks.
 
-Closing that last gap is exactly what tier 3 (client code) does; by choosing "0
-client code" we accept detection instead of prevention.
+Closing the "which endpoint did my request hit" gap is exactly what tier 3
+(client code) does; by choosing "0 client code" we accept detection instead of
+prevention.
 
 ## 7. Deployment: use dstack, not hand-rolled confidential TLS
 
@@ -210,11 +246,12 @@ does not.
 
 ## 10. Phasing
 
-1. **Gateway = client core + a plaintext HTTP server shell**, deployed on dstack
-   with ZT-HTTPS (TLS in the TEE). 0-code inference works; validation not yet
+1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM** with
+   ZT-HTTPS (TLS in the TEE). 0-code inference works; validation not yet
    published. (Tier "2, un-auditable" — internal / testing only.)
-2. **Quote API + cert-key binding in `report_data`**. An operator/CLI can now
-   validate out of band. (Tier 2.5.)
+2. **Quote API + cert-key binding in `report_data` + per-request response
+   signature.** An operator/CLI can now validate out of band, and each response
+   is individually auditable. (Tier 2.5.)
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
