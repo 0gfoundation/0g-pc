@@ -18,6 +18,11 @@ import (
 // bound can pass their own context deadline.
 const defaultTimeout = 120 * time.Second
 
+// DefaultProviderURL is where a sealed request is POSTed when Provider.URL is
+// empty: the 0G router's OpenAI chat-completions endpoint. (Provider discovery —
+// the router's GET /v1/providers — is a separate, later concern.)
+const DefaultProviderURL = "https://router-api.0g.ai/v1/chat/completions"
+
 // Stage names where a Complete call failed, so callers (the sidecar) can map it
 // to an HTTP status: a bad client request vs an upstream/provider failure vs a
 // client-side internal error.
@@ -56,8 +61,12 @@ type Client struct {
 	http     *http.Client
 }
 
-// New returns a Client for the given provider.
+// New returns a Client for the given provider. An empty Provider.URL defaults to
+// DefaultProviderURL.
 func New(p Provider) *Client {
+	if p.URL == "" {
+		p.URL = DefaultProviderURL
+	}
 	return &Client{provider: p, http: &http.Client{Timeout: defaultTimeout}}
 }
 

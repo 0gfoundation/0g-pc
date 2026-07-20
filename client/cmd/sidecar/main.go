@@ -28,13 +28,13 @@ const maxRequestBytes = 10 << 20 // 10 MiB
 
 func main() {
 	listen := flag.String("listen", "localhost:8787", "address to listen on")
-	providerURL := flag.String("provider-url", "", "provider (router/broker) OpenAI endpoint")
+	providerURL := flag.String("provider-url", core.DefaultProviderURL, "provider (router/broker) OpenAI chat-completions endpoint")
 	encPubB64 := flag.String("provider-enc-key", "", "provider HPKE public key, base64url (attestation stub)")
 	signer := flag.String("provider-signer", "", "provider on-chain signer address (0x...)")
 	flag.Parse()
 
-	if *providerURL == "" || *encPubB64 == "" || *signer == "" {
-		log.Fatal("provider-url, provider-enc-key and provider-signer are all required")
+	if *encPubB64 == "" || *signer == "" {
+		log.Fatal("provider-enc-key and provider-signer are required")
 	}
 	encPub, err := base64.RawURLEncoding.DecodeString(*encPubB64)
 	if err != nil {
