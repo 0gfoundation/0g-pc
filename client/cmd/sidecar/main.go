@@ -89,8 +89,7 @@ func newHandler(c *core.Client) http.Handler {
 			return
 		}
 		if stream {
-			// Fail loud: a streaming client must not receive a non-SSE body.
-			writeError(w, http.StatusNotImplemented, "streaming (stream: true) is not yet supported")
+			serveStream(w, r, c, req)
 			return
 		}
 		resp, err := c.Complete(r.Context(), req)
@@ -153,6 +152,61 @@ func statusFor(err error) int {
 		}
 	}
 	return http.StatusBadGateway
+}
+
+// serveStream proxies a streaming completion as Server-Sent Events: it opens
+// each sealed frame from the core and re-emits it as `data: <json>` to the user,
+// terminating with `data: [DONE]`. Status is only settable before the first
+// frame; once bytes are on the wire an error can only end the stream.
+func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wire.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported by server")
+		return
+	}
+
+	wroteHeader := false
+	writeHeader := func() {
+		if wroteHeader {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no") // ask a fronting proxy (nginx) not to buffer
+		w.WriteHeader(http.StatusOK)
+		wroteHeader = true
+	}
+
+	err := c.CompleteStream(r.Context(), req, func(frame wire.Response) error {
+		b, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		writeHeader()
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	})
+	if err != nil {
+		if !wroteHeader {
+			// Nothing sent yet — a normal error response with a real status.
+			writeError(w, statusFor(err), err.Error())
+			return
+		}
+		// Mid-stream: surface as a final SSE error event, then stop. Build the
+		// payload with json.Marshal — %q is not JSON-safe for arbitrary bytes.
+		errEvent, _ := json.Marshal(map[string]any{"error": map[string]string{"message": err.Error()}})
+		fmt.Fprintf(w, "data: %s\n\n", errEvent)
+		flusher.Flush()
+		return
+	}
+	// A successful stream always delivered its final frame, so wroteHeader is
+	// already true here; this is a defensive no-op guard.
+	writeHeader()
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // writeError emits an OpenAI-shaped error object.

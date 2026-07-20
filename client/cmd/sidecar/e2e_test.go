@@ -186,26 +186,112 @@ func TestSidecarPassesUpstreamStatus(t *testing.T) {
 	}
 }
 
-// stream:true must be rejected loudly (501) rather than answered with a non-SSE
-// body a streaming client cannot parse.
-func TestSidecarRejectsStreaming(t *testing.T) {
+// mockStreamingBroker opens the sealed request and streams sealed response
+// frames back as SSE, symmetric with the real broker's streaming path.
+func mockStreamingBroker(t *testing.T, encPriv crypto.PrivateKey, signer string, deltas []string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// The broker reads "stream" from the cleartext envelope to know to stream.
+		if s, _ := env["stream"]; string(s) != "true" {
+			http.Error(w, "expected stream:true in cleartext", http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		sealer, err := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for i, d := range deltas {
+			frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":` + d + `}]`)}
+			sealed, err := sealer.SealFrame(frame, nil, i == len(deltas)-1)
+			if err != nil {
+				return
+			}
+			b, _ := json.Marshal(sealed)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(b)
+			_, _ = w.Write([]byte("\n\n"))
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+}
+
+// A streaming request flows end to end: the sidecar emits plaintext SSE frames
+// the user reassembles, terminated by [DONE], and the prompt never leaks.
+func TestSidecarStreaming(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
 	signer := "0x" + strings.Repeat("c", 40)
-	broker := mockBroker(t, encPriv, signer)
+	broker := mockStreamingBroker(t, encPriv, signer, []string{`{"content":"he"}`, `{"content":"ll"}`, `{"content":"o"}`})
 	defer broker.Close()
 
 	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
 	sidecar := httptest.NewServer(newHandler(client))
 	defer sidecar.Close()
 
-	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"the secret prompt"}]}`
 	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
 	if err != nil {
 		t.Fatalf("post to sidecar: %v", err)
 	}
 	defer httpResp.Body.Close()
-	if httpResp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("stream:true: got %d, want 501", httpResp.StatusCode)
+	if httpResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream: got %d", httpResp.StatusCode)
+	}
+	if ct := httpResp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	raw, _ := io.ReadAll(httpResp.Body)
+	if bytes.Contains(raw, []byte("secret prompt")) {
+		t.Fatal("prompt leaked into the response stream")
+	}
+
+	var content string
+	sawDone := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			continue
+		}
+		if payload == "[DONE]" {
+			sawDone = true
+			continue
+		}
+		var frame struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+			t.Fatalf("bad SSE frame %q: %v", payload, err)
+		}
+		if len(frame.Choices) > 0 {
+			content += frame.Choices[0].Delta.Content
+		}
+	}
+	if content != "hello" {
+		t.Fatalf("reassembled stream = %q, want %q", content, "hello")
+	}
+	if !sawDone {
+		t.Fatal("stream did not end with [DONE]")
 	}
 }
 
@@ -263,6 +349,125 @@ func TestSidecarSealsConfiguredExtraField(t *testing.T) {
 	if httpResp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(httpResp.Body)
 		t.Fatalf("got %d: %s", httpResp.StatusCode, b)
+	}
+}
+
+// A stream that ends without a final frame (provider crash / dropped connection)
+// must be surfaced as an error, not silently completed with [DONE]. The
+// mid-stream error event must itself be valid JSON.
+func TestSidecarStreamingTruncated(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		sealer, _ := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+		frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"par"}}]`)}
+		sealed, _ := sealer.SealFrame(frame, nil, false) // NOT final
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		b, _ := json.Marshal(sealed)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+		// Return without a final frame or [DONE] — a truncated stream.
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	raw, _ := io.ReadAll(httpResp.Body)
+
+	if strings.Contains(string(raw), "[DONE]") {
+		t.Fatal("a truncated stream must not be completed with [DONE]")
+	}
+	sawError := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || !strings.Contains(payload, "error") {
+			continue
+		}
+		var v map[string]any
+		if err := json.Unmarshal([]byte(payload), &v); err != nil {
+			t.Fatalf("error event is not valid JSON: %q", payload)
+		}
+		sawError = true
+	}
+	if !sawError {
+		t.Fatal("truncated stream did not surface an error event")
+	}
+}
+
+// A streaming request that hits an upstream non-2xx gets that status verbatim
+// (a normal error response, not SSE), since it fails before any frame is sent.
+func TestSidecarStreamingUpstreamStatus(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want 429 (upstream status passed through)", httpResp.StatusCode)
+	}
+}
+
+// A provider that returns a non-SSE 200 for a stream request (ignored
+// stream:true) fails loud (502) rather than yielding a silent empty stream.
+func TestSidecarStreamingNonSSEUpstream(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("c", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"not":"a stream"}`))
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("got %d, want 502 (non-SSE upstream)", httpResp.StatusCode)
 	}
 }
 
