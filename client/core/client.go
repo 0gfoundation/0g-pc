@@ -14,9 +14,10 @@ import (
 	"github.com/0gfoundation/0g-pc/protocol/wire"
 )
 
-// defaultTimeout bounds a whole request/response to the provider. Chat
-// completions can be slow, so it is generous; callers that need a different
-// bound can pass their own context deadline.
+// defaultTimeout bounds one non-streaming request/response to the provider.
+// Chat completions can be slow, so it is generous. It is applied per call via a
+// context deadline (NOT http.Client.Timeout, which would also cut off a long
+// stream); streaming relies on the caller's context instead.
 const defaultTimeout = 120 * time.Second
 
 // DefaultProviderURL is where a sealed request is POSTed when Provider.URL is
@@ -91,7 +92,7 @@ func New(p Provider, opts ...Option) *Client {
 	c := &Client{
 		provider:   p,
 		sealFields: wire.DefaultSealedFields(),
-		http:       &http.Client{Timeout: defaultTimeout},
+		http:       &http.Client{}, // no blunt Timeout; see defaultTimeout
 	}
 	for _, o := range opts {
 		o(c)
@@ -112,6 +113,9 @@ func New(p Provider, opts ...Option) *Client {
 // "verify response signature" step in doc.go) is a later step. Until then this
 // provides confidentiality but NOT response authenticity.
 func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	defer cancel()
+
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
 	// public half (§7) and we keep the private half to open it.
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
@@ -153,17 +157,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 // for a local user-operated sidecar (debugging) but must NOT be echoed back to
 // callers once the cloud-TEE gateway shell reuses this core.
 func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, int, error) {
-	body, err := json.Marshal(env)
-	if err != nil {
-		return nil, 0, fmt.Errorf("marshal envelope: %w", err)
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.provider.URL, bytes.NewReader(body))
-	if err != nil {
-		return nil, 0, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.doRequest(ctx, env)
 	if err != nil {
 		return nil, 0, fmt.Errorf("post to provider: %w", err)
 	}
@@ -177,6 +171,21 @@ func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, int, error
 		return nil, resp.StatusCode, fmt.Errorf("provider returned %d: %s", resp.StatusCode, respBody)
 	}
 	return respBody, resp.StatusCode, nil
+}
+
+// doRequest POSTs the sealed envelope and returns the raw response; the caller
+// owns resp.Body. Shared by the buffered (post) and streaming paths.
+func (c *Client) doRequest(ctx context.Context, env wire.Request) (*http.Response, error) {
+	body, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.provider.URL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	return c.http.Do(httpReq)
 }
 
 // sealedFieldsFor picks the configured sealed fields that are actually present

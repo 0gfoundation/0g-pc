@@ -1,0 +1,125 @@
+package core
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+
+	"github.com/0gfoundation/0g-pc/protocol/crypto"
+	"github.com/0gfoundation/0g-pc/protocol/wire"
+)
+
+// maxSSELine caps a single SSE data line read from the provider (one sealed
+// frame), guarding against an unbounded line.
+const maxSSELine = 4 << 20 // 4 MiB
+
+// CompleteStream performs a streaming chat completion. It seals req, sends it,
+// then reads the provider's SSE stream of sealed frames, opens each in order,
+// and calls onFrame with the plaintext frame. onFrame returning an error stops
+// the stream and is returned as-is (e.g. a client disconnect).
+//
+// No artificial timeout is imposed: streaming lifetime is governed by ctx (the
+// sidecar passes the request context, cancelled when the user disconnects).
+//
+// The same response-authenticity caveat as Complete applies (see its doc): the
+// frames are confidential but their origin is not yet authenticated.
+func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame func(wire.Response) error) error {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		return stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
+	}
+
+	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, c.sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
+	if err != nil {
+		return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+	}
+
+	resp, err := c.doRequest(ctx, sealed)
+	if err != nil {
+		return &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
+		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d: %s", resp.StatusCode, body)}
+	}
+
+	sse := newSSEReader(resp.Body)
+	var opener *wire.ResponseOpener
+	for {
+		data, err := sse.next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
+		}
+		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+			return nil
+		}
+
+		var frame wire.Response
+		if err := json.Unmarshal(data, &frame); err != nil {
+			return stageErr(StageUpstream, fmt.Errorf("decode stream frame: %w", err))
+		}
+		if opener == nil {
+			// The first frame carries enc; it sets up the shared HPKE context.
+			opener, err = wire.NewResponseOpener(ephPriv, frame)
+			if err != nil {
+				return stageErr(StageUpstream, fmt.Errorf("stream setup: %w", err))
+			}
+		}
+		out, err := opener.OpenFrame(frame)
+		if err != nil {
+			return stageErr(StageUpstream, fmt.Errorf("open stream frame: %w", err))
+		}
+		if err := onFrame(out); err != nil {
+			return err
+		}
+	}
+}
+
+// sseReader reads Server-Sent Events, returning each event's `data` payload. It
+// handles the subset OpenAI uses: one `data:` value per event, events separated
+// by a blank line, comments and other fields ignored.
+type sseReader struct{ sc *bufio.Scanner }
+
+func newSSEReader(r io.Reader) *sseReader {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), maxSSELine)
+	return &sseReader{sc: sc}
+}
+
+// next returns the next event's data bytes, or io.EOF when the stream ends.
+func (s *sseReader) next() ([]byte, error) {
+	var data []byte
+	have := false
+	for s.sc.Scan() {
+		line := s.sc.Bytes()
+		if len(line) == 0 { // blank line terminates an event
+			if have {
+				return data, nil
+			}
+			continue
+		}
+		if after, ok := bytes.CutPrefix(line, []byte("data:")); ok {
+			payload := bytes.TrimPrefix(after, []byte(" "))
+			if have {
+				data = append(data, '\n')
+			}
+			data = append(data, payload...)
+			have = true
+		}
+		// Other SSE fields (event:, id:, :comment) are ignored.
+	}
+	if err := s.sc.Err(); err != nil {
+		return nil, err
+	}
+	if have { // final event with no trailing blank line
+		return data, nil
+	}
+	return nil, io.EOF
+}
