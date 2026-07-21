@@ -71,6 +71,12 @@ The sidecar transparently verifies attestation and the per-response signature,
 and (where enabled) seals the sensitive request fields (prompt, tool defs) to the
 provider enclave.
 
+Your `api_key` is forwarded verbatim as the `Authorization` header on the
+request to the provider, so the router/broker can authenticate and bill it. It
+travels in cleartext alongside the other routing/billing fields — it is
+**not** one of the sealed (confidential) fields, since the provider needs it to
+identify the caller. Send no key and the request goes upstream unauthenticated.
+
 ## What it verifies
 
 - **Attestation** — the provider quote is genuine TEE hardware running the

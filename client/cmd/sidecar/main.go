@@ -8,6 +8,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -88,11 +89,14 @@ func newHandler(c *core.Client) http.Handler {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// Forward the caller's Authorization header (the 0G key an OpenAI SDK sends)
+		// to the provider so it can authenticate and bill. Absent header -> no-op.
+		ctx := core.WithCredential(r.Context(), r.Header.Get("Authorization"))
 		if stream {
-			serveStream(w, r, c, req)
+			serveStream(ctx, w, c, req)
 			return
 		}
-		resp, err := c.Complete(r.Context(), req)
+		resp, err := c.Complete(ctx, req)
 		if err != nil {
 			writeError(w, statusFor(err), err.Error())
 			return
@@ -158,7 +162,7 @@ func statusFor(err error) int {
 // each sealed frame from the core and re-emits it as `data: <json>` to the user,
 // terminating with `data: [DONE]`. Status is only settable before the first
 // frame; once bytes are on the wire an error can only end the stream.
-func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wire.Request) {
+func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -177,7 +181,7 @@ func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wir
 		wroteHeader = true
 	}
 
-	err := c.CompleteStream(r.Context(), req, func(frame wire.Response) error {
+	err := c.CompleteStream(ctx, req, func(frame wire.Response) error {
 		b, err := json.Marshal(frame)
 		if err != nil {
 			return err
