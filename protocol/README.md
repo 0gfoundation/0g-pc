@@ -76,3 +76,27 @@ types/           # Candidate, RouteManifest, ChatSignature, ...
 The Go packages here are the **reference implementation**. Any non-Go
 implementation (e.g. a TS/WASM build for the browser client) must conform to
 `SPEC.md` and match the reference byte-for-byte.
+
+## Benchmarks
+
+Micro-benchmarks cover the two hot paths separately, so cost is attributable to
+the layer that owns it:
+
+```
+cd protocol
+go test -run '^$' -bench . -benchmem ./crypto/... ./wire/...
+```
+
+- **`crypto`** isolates the HPKE handshake (`SetupSender`/`SetupReceiver` — one
+  X25519 DH per request) from the ChaCha20-Poly1305 AEAD (`SealAEAD`, a reused
+  context, i.e. streaming's per-frame cost), plus the full one-shot `Seal`/`Open`
+  across payload sizes and a parallel run for core scaling.
+- **`wire`** measures the end-to-end envelope — `SealRequest`/`OpenRequest` and
+  `Seal`/`OpenResponse` — **including** JCS canonicalization and JSON, plus
+  `ResponseSealFrame` for the per-frame streaming cost.
+
+Two things the numbers make concrete: the per-request cost is dominated by the
+single X25519 handshake (the AEAD is comparatively free), and at large payloads
+the end-to-end envelope is bounded by JCS + JSON, not the crypto. Absolute
+figures are machine-dependent — run the benches on the target host rather than
+pinning numbers here.
