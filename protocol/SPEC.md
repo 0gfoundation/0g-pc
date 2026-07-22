@@ -7,8 +7,8 @@ Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**. Candidate scoring (the router's ranking rule) is referenced but
-> specified separately.
+> verification**. Candidate scoring is the router's own internal concern
+> (surfaced through its candidate API), not part of this protocol.
 
 ## 1. Scope
 
@@ -336,7 +336,8 @@ separately.
 
 Out of scope for v1 (tracked):
 
-- Candidate scoring algorithm (§4.4; specified separately).
+- Candidate scoring algorithm — the router's own internal concern, surfaced
+  through its candidate API (§4.4); not a protocol contract.
 - A "strict" client mode that seals unknown fields **by default** (inverts the
   §5.1 trade-off for high-privacy users).
 - Sender-authenticated HPKE / PSK modes.

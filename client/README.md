@@ -54,8 +54,10 @@ Design docs live at the repo root under
 [`docs/design`](../docs/design) (currently `router-e2e.md`).
 
 Depends on **`github.com/0gfoundation/0g-pc/protocol`** — the shared wire
-format, verification/sealing crypto, and route-scoring logic used by the broker,
-the router, and this client, so all three agree byte-for-byte.
+format and verification/sealing crypto used by the broker, the router, and this
+client, so all three agree byte-for-byte. (Provider scoring is not part of the
+protocol; the router owns it and exposes the best provider + fallback list via
+its candidate API.)
 
 ## Quickstart (sidecar)
 
