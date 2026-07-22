@@ -42,9 +42,10 @@ Provider **scoring / ranking is not part of this contract** — it lives entirel
 in the **router**, which exposes it as an API (request metadata in → best
 provider + fallback list out). The client does not re-run any scorer, so there is
 no ordering to keep in sync here. This module carries a single contract: the
-confidentiality / proof **wire format** (`wire crypto attest proof`) that binds
-**broker ↔ client**, plus the shared `types`. The invariant is unchanged —
-*everyone on `protocol` vX, no drift*.
+confidentiality / proof **wire format** (`wire crypto attest proof`) — sealing
+and response proofs bind **broker ↔ client**, while the **router** reads only the
+envelope's cleartext manifest — plus the shared `types`. The invariant is
+unchanged — *everyone on `protocol` vX, no drift*.
 
 ## Layout
 
