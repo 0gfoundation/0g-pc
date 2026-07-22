@@ -1,9 +1,10 @@
-# 0g-pc-client
+# 0g-pc-e2ee/client
 
-Client for **0G Private Computer** — verifiable and (optionally) confidential
-inference on the 0G Compute Network. It lets you verify that a response really
-came from an attested TEE provider, and — on the router path — keep your prompt
-unreadable to everything between you and the provider enclave.
+Client for **0G Private Computer** — end-to-end-encrypted (E2EE) inference on the
+0G Compute Network. E2EE here is the broad sense, both halves of a secure channel
+to an attested provider enclave: **authenticity** — verify that a response really
+came from an attested TEE provider — and **confidentiality** — on the router path,
+keep your prompt unreadable to everything between you and the provider enclave.
 
 > Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
 > (see `router-e2e.md`). Interfaces will change.
@@ -24,6 +25,14 @@ Sealing (end-to-end confidentiality) is **required on the router path** (an L7
 reseller router terminates TLS there by design) and **optional on the direct
 path** (direct TLS terminates inside the provider CVM, and every response is
 signed — see the design doc).
+
+> **Scope, stated explicitly.** This client is the **E2EE layer**. On the router
+> path that means both halves — sealing *and* verification. On the direct path
+> with sealing off, confidentiality is already provided by the CVM-terminated
+> TLS, so the client's distinctive job there is **authenticity** (attestation +
+> response-signature verification). A caller who wants *neither* can talk to the
+> provider directly and skip this client entirely — that is a deliberate product
+> boundary (we do not wrap plain, unverified passthrough), not a missing feature.
 
 ## Layout
 
@@ -53,15 +62,17 @@ sdk/
 Design docs live at the repo root under
 [`docs/design`](../docs/design) (currently `router-e2e.md`).
 
-Depends on **`github.com/0gfoundation/0g-pc/protocol`** — the shared wire
-format, verification/sealing crypto, and route-scoring logic used by the broker,
-the router, and this client, so all three agree byte-for-byte.
+Depends on **`github.com/0gfoundation/0g-pc-e2ee/protocol`** — the shared wire
+format and verification/sealing crypto used by the broker, the router, and this
+client, so all three agree byte-for-byte. (Provider scoring is not part of the
+protocol; the router owns it and exposes the best provider + fallback list via
+its candidate API.)
 
 ## Quickstart (sidecar)
 
 ```bash
 # run the sidecar (details TBD)
-0g-pc-sidecar --listen localhost:8787
+0g-pc-e2ee-sidecar --listen localhost:8787
 ```
 
 Point any OpenAI SDK at it:
@@ -105,9 +116,16 @@ model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
 ## Related repositories & products
 
+This repo (**`0g-pc-e2ee`**) holds two Go modules:
+
+| Module (this repo) | Role |
+|------|------|
+| `protocol` | shared wire format + verification/sealing crypto — the E2EE contract |
+| `client` (this) | client core + its forms: sidecar, in-process SDK, and the 0G-operated gateway |
+
+External:
+
 | Repo/Product | Role |
 |------|------|
-| `0g-pc-client` (this) | user-side sidecar / SDK / gateway |
-| `0g-pc/protocol` | shared wire format + crypto + route logic |
 | `0g-serving-broker` | provider-side broker (server) |
 | `Private Computer` | L7 aggregating router (product: Private Computer) |
