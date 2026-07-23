@@ -43,9 +43,12 @@ import (
 var b64 = base64.RawURLEncoding
 
 const (
-	// DefaultPreviewURL is the 0G router's route-preview endpoint, sibling of
-	// core.DefaultProviderURL.
-	DefaultPreviewURL = "https://router-api.0g.ai/v1/routing/preview"
+	// DefaultRouterURL is the 0G router's base URL. The route-preview path is
+	// appended to it; callers configure the router domain, not the full endpoint.
+	DefaultRouterURL = "https://router-api.0g.ai"
+	// previewPath is the router's route-preview endpoint, appended to the router
+	// base URL. It is owned here because this package owns that API contract.
+	previewPath = "/v1/routing/preview"
 	// DefaultType is the inference kind sent to the preview API for a chat
 	// completion.
 	DefaultType = "chat"
@@ -114,12 +117,15 @@ func WithPubkeyTTL(d time.Duration) Option {
 	return func(r *Router) { r.cache = newPubkeyCache(d) }
 }
 
-// New returns a Router that previews against previewURL (empty uses
-// DefaultPreviewURL).
-func New(previewURL string, opts ...Option) *Router {
-	if previewURL == "" {
-		previewURL = DefaultPreviewURL
+// New returns a Router that previews against the given router base URL (empty
+// uses DefaultRouterURL). The route-preview path is appended to it, so callers
+// configure only the router domain — a trailing slash and a base path prefix are
+// both respected (e.g. "https://host/api" → "https://host/api/v1/routing/preview").
+func New(routerURL string, opts ...Option) *Router {
+	if routerURL == "" {
+		routerURL = DefaultRouterURL
 	}
+	previewURL := strings.TrimRight(routerURL, "/") + previewPath
 	// A dedicated transport with a bounded header wait, mirroring core.New; the
 	// control-plane calls are short, so no long-stream concern applies.
 	tr := http.DefaultTransport.(*http.Transport).Clone()

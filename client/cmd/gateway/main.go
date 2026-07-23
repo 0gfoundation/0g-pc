@@ -34,7 +34,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", ":8443", "address to listen on")
-	previewURL := flag.String("router-preview-url", route.DefaultPreviewURL, "router route-preview endpoint (POST)")
+	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
 	routeType := flag.String("route-type", route.DefaultType, "inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
@@ -48,7 +48,7 @@ func main() {
 	// provider's enc key + signer from the broker. The router is told to withhold
 	// exactly the sealed fields, so the prompt never reaches it in cleartext even
 	// on the control-plane preview call.
-	router := route.New(*previewURL,
+	router := route.New(*routerURL,
 		route.WithType(*routeType),
 		route.WithSensitiveFields(sealFields),
 	)
@@ -62,7 +62,7 @@ func main() {
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
-	log.Printf("gateway listening on %s -> route via %s", *listen, *previewURL)
+	log.Printf("gateway listening on %s -> route via %s", *listen, *routerURL)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
