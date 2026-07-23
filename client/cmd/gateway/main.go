@@ -14,9 +14,11 @@
 // X-0G-Provider-Address routing header, which the gateway forwards to the router
 // so preview returns that provider.
 //
-// Attestation (the /quote body and per-response signature, protocol/attest /
-// issue #7) is a later step; /quote is a stub until then. Trusting the router's
-// returned endpoint (vs resolving it on chain) is tracked in issue #18.
+// Attestation (the /quote body and per-response signature; issue #19, on
+// protocol/attest / issue #7) and multi-tenant concerns (auth, billing, rate
+// limiting; issue #20) are later steps; /quote is a stub until then. Trusting
+// the router's returned endpoint (vs resolving it on chain) is tracked in
+// issue #18.
 package main
 
 import (
@@ -79,9 +81,9 @@ func newHandler(c *core.Client) http.Handler {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 	// /quote will expose the enclave's attestation quote (with the TLS cert key
-	// bound into report_data) once protocol/attest lands (issue #7); until then
-	// it advertises the endpoint but is Not Implemented, so a validator gets a
-	// clear signal rather than a 404.
+	// bound into report_data) once the gateway attestation work lands (issue #19,
+	// on protocol/attest / issue #7); until then it advertises the endpoint but is
+	// Not Implemented, so a validator gets a clear signal rather than a 404.
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
 	})
