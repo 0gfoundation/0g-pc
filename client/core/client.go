@@ -84,8 +84,8 @@ func resolveErr(err error) error {
 //     signs responses.
 //   - Address is the router-facing provider address, sent as X-0G-Provider-Address
 //     so a fronting router forwards to exactly this provider (the routing pin).
-//     Empty means "set no routing pin" (e.g. the pin-only sidecar, which does
-//     not select via the router).
+//     Empty means "set no routing pin" (a static provider that does not select
+//     via the router).
 type Provider struct {
 	URL        string           // OpenAI-shaped endpoint (router or broker)
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
@@ -99,9 +99,10 @@ type Provider struct {
 // SDK all wrap this. A Client is safe for concurrent use.
 //
 // The provider it seals to is not fixed on the Client: a Resolver picks it per
-// request. New wraps a single flag-configured provider in a static resolver
-// (the pin-only path); NewWithResolver takes a resolver that chooses per request
-// (the gateway's route mode).
+// request. NewWithResolver takes a resolver that chooses per request — the route
+// resolver (client/route) used by both shipped server forms, the sidecar and the
+// gateway. New wraps a single fixed provider in a static resolver, the low-level
+// case for a caller that already holds a provider identity.
 type Client struct {
 	resolver   Resolver
 	sealFields []string
@@ -125,8 +126,10 @@ func WithSealFields(fields []string) Option {
 	return func(c *Client) { c.sealFields = slices.Clone(fields) }
 }
 
-// New returns a Client that seals every request to the given provider (the
-// pin-only path). An empty Provider.URL defaults to DefaultProviderURL; the
+// New returns a Client that seals every request to one fixed provider — the
+// low-level static case (tests, or direct-seal to a provider already known and
+// verified). The shipped server forms use NewWithResolver with the route
+// resolver instead. An empty Provider.URL defaults to DefaultProviderURL; the
 // sealed-field set defaults to wire.DefaultSealedFields.
 func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
@@ -171,9 +174,9 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 
-	// Pick the provider to seal to. The pin-only path returns the fixed provider;
-	// route mode consults the router and fetches the chosen provider's enc key,
-	// so this may make network calls (bounded by the ctx deadline above).
+	// Pick the provider to seal to. A static resolver returns the fixed provider;
+	// the route resolver consults the router and fetches the chosen provider's enc
+	// key, so this may make network calls (bounded by the ctx deadline above).
 	provider, err := c.resolver.Resolve(ctx, req)
 	if err != nil {
 		return nil, resolveErr(err)
@@ -280,7 +283,7 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 	// fallback, so a router routes to exactly that provider — never re-routing or
 	// falling back to one whose key cannot open this envelope. The pin is the
 	// router-facing provider address (Address), not the signer. When there is no
-	// routing pin (Address empty — the pin-only sidecar) or provider.URL is a
+	// routing pin (Address empty — a static provider) or provider.URL is a
 	// provider/broker directly, only the fallback directive is set (and a direct
 	// provider ignores it). Set after the forwarded headers so the resolved
 	// provider is authoritative over any forwarded pin.

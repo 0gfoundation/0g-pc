@@ -23,8 +23,8 @@
 // X-0G-Provider-Address (with fallback off) so the router forwards to exactly
 // the provider whose key the request is sealed to.
 //
-// As with the pin-only stub, the enc key is trusted as delivered here; verifying
-// it out of an attestation quote (protocol/attest, issue #7) is a later step.
+// The enc key is trusted as delivered here; verifying it out of an attestation
+// quote (protocol/attest, issue #7) is a later step.
 package route
 
 import (

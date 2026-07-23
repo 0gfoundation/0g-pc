@@ -37,8 +37,8 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Pick the provider to seal to (pin-only returns the fixed one; route mode
-	// consults the router/broker — a network call bounded by ctx).
+	// Pick the provider to seal to (a static resolver returns the fixed one; the
+	// route resolver consults the router/broker — a network call bounded by ctx).
 	provider, err := c.resolver.Resolve(ctx, req)
 	if err != nil {
 		return resolveErr(err)

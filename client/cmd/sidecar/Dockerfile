@@ -47,7 +47,7 @@ EXPOSE 8787
 
 # Bind to all interfaces so the port is reachable from outside the container
 # (the binary defaults to localhost, which would be container-local only).
-# The required provider flags are appended by the caller, e.g.:
-#   docker run -p 8787:8787 <img> \
-#     --provider-enc-key <base64url> --provider-signer 0x...
+# The sidecar routes via the 0G router by default; override the router with
+# --router-url if needed, e.g.:
+#   docker run -p 8787:8787 <img> --router-url https://router-api.0g.ai
 ENTRYPOINT ["/usr/local/bin/sidecar", "--listen", "0.0.0.0:8787"]
