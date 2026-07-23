@@ -123,7 +123,7 @@ type E2EE struct {
 	V            int      `json:"v"`
 	KEMID        string   `json:"kem_id"`
 	KeyID        string   `json:"key_id"`         // base64url(SHA-256(enc_pub)[0:8])
-	SignerAddr   string   `json:"signer_addr"`    // provider TEE signer address (teeSignerAddress, 0x…); the pin
+	SignerAddr   string   `json:"signer_addr"`    // provider TEE signer address (teeSignerAddress, 0x…); the enclave verifies it and signs responses with it
 	ClientEphPub string   `json:"client_eph_pub"` // base64url X25519, for response sealing
 	Enc          string   `json:"enc"`            // base64url HPKE encapsulated key
 	SealedFields []string `json:"sealed_fields"`
