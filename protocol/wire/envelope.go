@@ -66,6 +66,12 @@ func ValidateSealedFields(fields []string) error {
 	seen := make(map[string]struct{}, len(fields))
 	hasMessages := false
 	for _, f := range fields {
+		if f == "" {
+			return fmt.Errorf("empty sealed field name")
+		}
+		if f == e2eeKey {
+			return fmt.Errorf("%q is reserved and cannot be a sealed field", e2eeKey)
+		}
 		if _, dup := seen[f]; dup {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
@@ -244,6 +250,13 @@ func OpenRequest(priv crypto.PrivateKey, env Request) (Request, error) {
 		out[k] = v
 	}
 	for k, v := range sealedObj {
+		// Defense in depth (H2): a decrypted `_e2ee` would otherwise slip the
+		// collision check below, since `out` is built with `_e2ee` excluded.
+		// sameKeys + ValidateSealedFields already forbid it, but a
+		// non-conformant sealer must never be able to inject the metadata key.
+		if k == e2eeKey {
+			return nil, fmt.Errorf("decrypted object must not contain %q", e2eeKey)
+		}
 		if _, clash := out[k]; clash {
 			return nil, fmt.Errorf("sealed field %q collides with a cleartext field", k)
 		}
