@@ -113,7 +113,7 @@ by the transport crypto — so nothing security-relevant may depend on them.
 | `provider_id` | The pinned recipient's on-chain signer address (`0x…`). Client asserts "I sealed to *this* provider/gateway." | Recipient checks `provider_id == self`; a router cannot silently reroute to another provider. **Bound.** |
 | `client_eph_pub` | Client's **ephemeral** X25519 public key; the enclave seals the **response** to it (§7). | Stored at request time, used at response time. **Must be bound** — else a MITM swaps its own key and reads the response. |
 | `enc` | HPKE **encapsulated key** (sender's ephemeral KEM output). Recipient derives the shared secret from `enc` + its private key. | **Bound.** |
-| `sealed_fields` | **Allowlist** of which fields were encrypted. After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. D6 🆕 flips the *default*: seal all except a declared `visible_fields` set (this list stays as the post-`Open` check). |
+| `sealed_fields` | **Allowlist** of which fields were encrypted ({`messages`, `tools`} by default). After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. Fail-open on unknown fields is accepted (D6). |
 | `unbound_fields` 🆕 | **Denylist** of cleartext fields intermediaries may add/modify/remove; these are **excluded from the AAD**. Everything else (except `ciphertext`) is bound by default. | The **list itself is bound** (it lives in `_e2ee`), so a router cannot enlarge it. Must be disjoint from `sealed_fields`. |
 | `ciphertext` | AEAD output (sealed body + tag), base64url. | The one field **always** excluded from the AAD (can't bind the ciphertext into its own AAD). |
 
@@ -195,56 +195,48 @@ response *content* (`model`, annotations, `reasoning` mirroring); any such
 transform moves inside the trust boundary — the denylist is for genuinely
 intermediary-owned metadata only.
 
-### D6 — seal by default; declare an explicit *visible* allowlist (fail-closed confidentiality) 🆕
-The mirror of D3, for confidentiality. Today `sealed_fields` is an allowlist of
-what gets **encrypted**, so unknown/new fields default to **cleartext** —
-fail-*open*, a silent leak (a future `user` / `metadata` field carrying PII).
-Flip it: the sealed set is the **complement of a declared `visible_fields`
-allowlist**, computed over the fields actually present, so anything not
-explicitly exposed is sealed — including fields this client version has never
-heard of. Guard: `messages` may never appear in `visible_fields`.
+### D6 — sealing stays an explicit `sealed_fields` allowlist; fail-open on new fields is accepted
+The mirror of D3 for confidentiality (seal-by-default via a `visible_fields`
+allowlist) was **considered and declined**. Sealing keeps today's model:
+`sealed_fields` explicitly lists what is **encrypted** ({`messages`, `tools`} by
+default), and unknown/new fields stay **cleartext** — fail-*open*.
 
-The router routes on the **generation parameters** (the fleet is heterogeneous —
-not every machine supports every param), so `visible_fields` is not small: it
-includes `model`, `temperature`, `max_tokens`, `top_p`, `stop`, `stream`,
-`response_format`, … The sealed set is therefore the **content** (`messages`,
-`tools`) plus any **non-routing / user-identifying** field (`user`, `metadata`,
-and — the real point — any field this client version does not yet know about).
+Rationale for accepting fail-open:
 
-So D6's practical effect is **narrow and honest**: it does *not* seal more of the
-known routing params (those are legitimately visible); it flips the *default* for
-the sensitive/unknown remainder from cleartext to sealed, closing the PII-leak
-path (a future `user`/`metadata`) that today's `sealed_fields` allowlist leaves
-open. Err toward sealing: forgetting to expose a needed routing param breaks
-routing loudly (fail-closed), never leaks. (`sealed_fields` may stay on the wire
-as the post-`Open` integrity check; the *default* is defined by `visible_fields`
-— encoding detail for SPEC.)
+- The always-present **content** (`messages`, `tools`) is always sealed — the
+  data that matters is never at risk from this default.
+- The fields this would otherwise catch (`user`, `metadata`, …) are
+  **developer-added and never auto-injected** by the OpenAI SDK (confirmed). A
+  leak requires a developer to both add PII *and* not seal it — an explicit
+  opt-in, not a silent trap sprung by the framework.
+- The allowlist is simpler on the wire and to reason about; the residual risk is
+  judged acceptable pre-launch.
 
-**Read ≠ mutate.** A visible param is still **bound** (category ②): the router
+**Intentional asymmetry with D3.** Integrity binding is fail-*closed* (a
+denylist, D3); confidentiality sealing is fail-*open* (an allowlist, D6). This is
+deliberate: tampering is adversarial and must fail closed, whereas leaking a
+field the developer chose to add is opt-in and acceptable. If a field later
+proves commonly sensitive, add it to the default sealed set.
+
+**Read ≠ mutate.** A cleartext param is still **bound** (category ②): the router
 reads it to route but may not rewrite it — else it could downgrade your sampling
 or cap `max_tokens` undetectably. A field the router genuinely *rewrites* today
 (e.g. forcing `stream_options.include_usage=true`) must therefore be either
 listed in `unbound_fields` (low-stakes, untrusted) or — cleaner — set by the
 client up front so no rewrite is needed.
 
-**Explicit declaration vs default policy — keep them separate.** "Marking the
-partition" never goes away: the seal/cleartext split must be declared
-*explicitly and bound* on the wire so the enclave can verify it and no
-intermediary can shift a field across the line. What D6 changes is only *which*
-list is authoritative. Make `visible_fields` the single bound allowlist: the
-sealed set is then "everything present that is not visible (nor `_e2ee`)", so an
-unknown field is sealed (fail-closed). `sealed_fields` is derivable from it
-(= present − visible − unbound) and need not be sent separately — the enclave
-verifies the partition against the bound `visible_fields`. So yes, mark the
-boundary explicitly; just enumerate the *visible* set, because that is the
-enumeration that fails safe.
+**Explicit declaration stays.** Independent of the fail-open default: the
+seal/cleartext split is declared *explicitly and bound* via `sealed_fields`
+(inside `_e2ee`, covered by the AAD), and the enclave verifies decrypted keys ==
+`sealed_fields`. That declaration is what stops an intermediary shifting a field
+across the line; it is unaffected by the D6 decision.
 
-Secure-default summary — two mirror-image declarations:
+Two declarations, deliberately **asymmetric** defaults:
 
 | Dimension | Declares | Default | A new/unknown field is |
 |---|---|---|---|
-| Confidentiality (D6) | `visible_fields` (who the router sees) | seal all | sealed (safe) |
-| Integrity (D3) | `unbound_fields` (who may mutate) | bind all | bound (safe) |
+| Confidentiality (D6) | `sealed_fields` (what is encrypted) | cleartext | cleartext (fail-open, **accepted**) |
+| Integrity (D3) | `unbound_fields` (who may mutate) | bind all | bound (fail-closed) |
 
 ---
 
@@ -272,19 +264,25 @@ Beyond the field model above, these deserve a decision (some already tracked):
   *relocating* the router's content-touching features (search/file injection,
   response content rewrites) off the routing layer — to the client or a dedicated
   attested TEE node. Tracked as follow-up work, not a protocol-format question.
-- **Forward secrecy of requests.** Requests are sealed to the provider's *static*
-  enc key (HPKE base mode). Compromise of that key (or the enclave) retroactively
-  exposes all captured requests. Mitigation: measurement-tied key rotation with a
-  short TTL (already in `router-e2e.md` "Harden") bounds the window; a fuller fix
-  is an ephemeral-ephemeral handshake. Worth an explicit rotation cadence.
-- **Sealing default is fail-*open* for new fields.** Per SPEC §5.1, unknown/new
-  fields default to **cleartext**. That is the opposite safe-default from the
-  binding denylist (D3), and its failure mode is a silent **leak** (e.g. a future
-  `user` / `metadata` field carrying PII). Recommend a "sensitive-by-default"
-  review of known OpenAI fields before launch.
-- **Request↔response binding.** Confirm the §8 signature covers a hash of the
-  request (not just the response), so a router cannot splice a different or stale
-  response. `client_eph_pub` already scopes decryptability per request.
+- **Forward secrecy of requests — reduces to enc-key rotation cadence.** Only the
+  *sender* is ephemeral per request; the request is sealed to the provider's
+  *recipient* enc key, so `shared = DH(client_eph, provider_enc)`. If that
+  recipient key later leaks, an attacker who captured `{ciphertext, enc}` recovers
+  every past request — the per-request client ephemeral does not help (its public
+  half is `enc`, on the wire). (The **response** direction *is* forward-secret:
+  both sides are ephemeral there.) **But** if the provider enc key lives only
+  inside the TEE, is never persisted, and is re-derived per enclave lifecycle
+  (measurement-tied), it is not a long-lived static key — compromising it means
+  breaking a live TEE, already outside the trust model. So this is not a gap to
+  close with a new handshake; it is a **rotation-cadence / TTL decision**. Pick one.
+- **Sealing default is fail-*open* — DECIDED (D6): accepted.** Sealing keeps the
+  `sealed_fields` allowlist; unknown/new fields stay cleartext. Accepted because
+  the sensitive fields it would catch (`user`, `metadata`) are developer-added,
+  never auto-injected, and the content is always sealed. See D6.
+- **Request↔response binding — RESOLVED.** Confirmed present: the §8 signature
+  covers the request hash (not just the response), so a router cannot splice a
+  different or stale response. `client_eph_pub` additionally scopes
+  decryptability per request.
 - **Replay / freshness.** Already tracked in `router-e2e.md` "Limitations": a
   per-request nonce in the body (its hash is signed) defeats client-side replay; a
   server timestamp/nonce is the belt-and-suspenders fix. Relevant to billing.
