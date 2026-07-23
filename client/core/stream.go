@@ -37,26 +37,73 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Pick the provider to seal to (a static resolver returns the fixed one; the
-	// route resolver consults the router/broker — a network call bounded by ctx).
-	provider, err := c.resolver.Resolve(ctx, req)
+	// Pick the candidates to seal to, best first (a static resolver returns one
+	// fixed provider; the route resolver consults the router/broker — a network
+	// call bounded by ctx).
+	cands, err := c.resolver.Resolve(ctx, req)
 	if err != nil {
 		return resolveErr(err)
 	}
 
+	// One ephemeral keypair for the whole call, reused across fallback attempts:
+	// nothing has been opened until the first frame is delivered, so re-sealing to
+	// the next candidate with the same response key is safe.
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		return stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	sealed, err := wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
-	if err != nil {
-		return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+	// Fall back down the candidate chain, but only until the first frame reaches
+	// onFrame: once a token has been delivered to the caller the stream is
+	// committed to that provider and cannot be restarted on another (streaming
+	// fallback is pre-first-token only — docs/design/router-e2e.md "Limitations").
+	var lastErr error
+	for i := 0; i < cands.Len(); i++ {
+		provider, err := cands.Provider(ctx, i)
+		if err != nil {
+			lastErr = resolveErr(err)
+			continue
+		}
+		sealed, err := c.seal(provider, req, ephPub)
+		if err != nil {
+			// Request-level failure — identical for every candidate; fail fast.
+			return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+		}
+		committed, err := c.streamOnce(ctx, provider, sealed, ephPriv, onFrame)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if committed {
+			// A frame already reached the caller (or the caller aborted); the
+			// stream is bound to this provider — surface the error, do not retry.
+			return err
+		}
+		// Nothing was delivered yet — try the next candidate.
 	}
+
+	if lastErr == nil {
+		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
+	}
+	return lastErr
+}
+
+// streamOnce posts one sealed envelope to a single provider and pumps its SSE
+// stream of sealed frames into onFrame. committed reports whether the stream can
+// no longer be retried on another provider: it becomes true the moment a frame
+// is delivered to onFrame (pre-first-token fallback only) or onFrame itself
+// errors (a client disconnect, returned as-is). A pre-delivery failure returns
+// committed=false so the caller can fall back to the next candidate.
+func (c *Client) streamOnce(ctx context.Context, provider Provider, sealed wire.Request, ephPriv crypto.PrivateKey, onFrame func(wire.Response) error) (committed bool, err error) {
+	// A per-attempt cancel drives the idle watchdog, so a stall aborts only this
+	// attempt's read — not the parent context, which would poison a fallback to
+	// the next candidate. The parent still cancels this attempt (child of ctx).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
-		return &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
+		return false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -64,13 +111,13 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		// debugging (the sidecar can surface it) but keep it out of the message, so
 		// a multi-tenant gateway never echoes it back (see Error.Body).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
+		return false, &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
 	}
 	// A 200 that is not an event stream (a provider that ignored stream:true)
 	// would be read as zero frames and silently yield an empty stream; fail loud.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body)}
+		return false, &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body)}
 	}
 
 	// Abort if the provider stalls between frames.
@@ -91,44 +138,47 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			// A stream that ends without its final frame was truncated (provider
 			// crash / dropped connection) — not a complete answer.
 			if !sawFinal {
-				return stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
+				return committed, stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
 			}
-			return nil
+			return true, nil
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
+				return committed, stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
 			}
-			return stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
+			return committed, stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
 		}
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			if !sawFinal {
-				return stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
+				return committed, stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
 			}
-			return nil
+			return true, nil
 		}
 
 		var frame wire.Response
 		if err := json.Unmarshal(data, &frame); err != nil {
-			return stageErr(StageUpstream, fmt.Errorf("decode stream frame: %w", err))
+			return committed, stageErr(StageUpstream, fmt.Errorf("decode stream frame: %w", err))
 		}
 		fe, err := frame.E2EE()
 		if err != nil {
-			return stageErr(StageUpstream, fmt.Errorf("read frame metadata: %w", err))
+			return committed, stageErr(StageUpstream, fmt.Errorf("read frame metadata: %w", err))
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
 			opener, err = wire.NewResponseOpener(ephPriv, frame)
 			if err != nil {
-				return stageErr(StageUpstream, fmt.Errorf("stream setup: %w", err))
+				return committed, stageErr(StageUpstream, fmt.Errorf("stream setup: %w", err))
 			}
 		}
 		out, err := opener.OpenFrame(frame)
 		if err != nil {
-			return stageErr(StageUpstream, fmt.Errorf("open stream frame: %w", err))
+			return committed, stageErr(StageUpstream, fmt.Errorf("open stream frame: %w", err))
 		}
+		// From here the caller receives bytes: the stream is committed to this
+		// provider and can no longer be retried on another.
+		committed = true
 		if err := onFrame(out); err != nil {
-			return err
+			return true, err
 		}
 		if fe.Final {
 			sawFinal = true

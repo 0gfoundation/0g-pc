@@ -91,6 +91,14 @@ type Provider struct {
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
 	SignerAddr string           // on-chain TEE signer; sealed into _e2ee.signer_addr, verifies responses
 	Address    string           // router-facing provider address; sent as X-0G-Provider-Address (routing pin)
+	// Model is the provider's canonical model id (the route preview's
+	// canonical_id). Each candidate may serve a different model — the preview
+	// list is heterogeneous when the caller omits "model" — so the client writes
+	// this into the envelope's cleartext "model" before sealing, so the request
+	// names the model this specific provider actually serves. Empty means "leave
+	// the request's model as-is" (a static provider, or a caller that already
+	// pinned the model).
+	Model string
 }
 
 // Client is the shared client core: it seals a request's sensitive fields to
@@ -174,50 +182,76 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 
-	// Pick the provider to seal to. A static resolver returns the fixed provider;
-	// the route resolver consults the router and fetches the chosen provider's enc
-	// key, so this may make network calls (bounded by the ctx deadline above).
-	provider, err := c.resolver.Resolve(ctx, req)
+	// Pick the candidates to seal to, best first. A static resolver returns one
+	// fixed provider; the route resolver consults the router and returns the
+	// fallback chain, so this may make network calls (bounded by the ctx deadline
+	// above).
+	cands, err := c.resolver.Resolve(ctx, req)
 	if err != nil {
 		return nil, resolveErr(err)
 	}
 
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
-	// public half (§7) and we keep the private half to open it.
+	// public half (§7) and we keep the private half to open it. Reused across
+	// fallback attempts — it is the client's own response key, independent of
+	// which provider a candidate is.
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		return nil, stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	sealed, err := wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
-	if err != nil {
-		// Given a valid provider config (validated at startup), a seal failure is
-		// a bad request — e.g. no messages to seal.
-		return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
-	}
-
-	respBody, status, err := c.post(ctx, provider, sealed)
-	if err != nil {
-		// Surface a non-2xx provider status verbatim (status is 0 for a transport
-		// failure, which statusFor maps to 502) so OpenAI clients can key their
-		// retry/backoff on it — 429/5xx retry, 4xx fail fast. For a non-2xx,
-		// respBody is the upstream body; carry it as Body (not in the message).
-		e := &Error{Stage: StageUpstream, Status: status, Err: err}
-		if status != 0 {
-			e.Body = string(respBody)
+	// Fall back down the candidate chain: seal to a candidate and post; on a
+	// provider failure re-seal to the next and retry (SPEC §4.4). lastErr holds
+	// the most recent failure so a fully exhausted chain surfaces a real cause.
+	var lastErr error
+	for i := 0; i < cands.Len(); i++ {
+		provider, err := cands.Provider(ctx, i)
+		if err != nil {
+			// This candidate could not be materialized (e.g. its pubkey fetch
+			// failed); skip it and try the next.
+			lastErr = resolveErr(err)
+			continue
 		}
-		return nil, e
+
+		sealed, err := c.seal(provider, req, ephPub)
+		if err != nil {
+			// A seal failure depends on the request, not the provider (e.g. no
+			// messages to seal), so it would fail identically for every candidate —
+			// fail fast rather than retry the chain.
+			return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+		}
+
+		respBody, status, err := c.post(ctx, provider, sealed)
+		if err != nil {
+			// Surface a non-2xx provider status verbatim (status is 0 for a transport
+			// failure, which statusFor maps to 502) so OpenAI clients can key their
+			// retry/backoff on it — 429/5xx retry, 4xx fail fast. For a non-2xx,
+			// respBody is the upstream body; carry it as Body (not in the message).
+			e := &Error{Stage: StageUpstream, Status: status, Err: err}
+			if status != 0 {
+				e.Body = string(respBody)
+			}
+			lastErr = e
+			continue
+		}
+
+		var sealedResp wire.Response
+		if err := json.Unmarshal(respBody, &sealedResp); err != nil {
+			return nil, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+		}
+		out, err := wire.OpenResponse(ephPriv, sealedResp)
+		if err != nil {
+			return nil, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+		}
+		return out, nil
 	}
 
-	var sealedResp wire.Response
-	if err := json.Unmarshal(respBody, &sealedResp); err != nil {
-		return nil, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+	// The chain was exhausted without a success. lastErr is set whenever Len() > 0
+	// (a candidate was tried); guard the impossible empty-chain case anyway.
+	if lastErr == nil {
+		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
-	out, err := wire.OpenResponse(ephPriv, sealedResp)
-	if err != nil {
-		return nil, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
-	}
-	return out, nil
+	return nil, lastErr
 }
 
 // post sends the envelope and returns the response body plus, for a non-2xx, the
@@ -298,6 +332,38 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 		httpReq.Header.Set("Authorization", cred)
 	}
 	return c.http.Do(httpReq)
+}
+
+// seal builds the sealed envelope for one provider: it writes the provider's
+// canonical model into the cleartext "model" (so the request names the model
+// this specific candidate serves — the preview chain is heterogeneous), then
+// seals the sensitive fields to the provider's enc key. Called once per fallback
+// attempt because the canonical model and enc key differ per candidate.
+func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
+	req = withModel(req, provider.Model)
+	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
+}
+
+// withModel returns req with its cleartext "model" set to model, leaving req
+// untouched when model is empty. It shallow-copies the map (values are opaque
+// json.RawMessage shared with req) so overwriting the model never mutates the
+// caller's request — the same req is re-sealed to each fallback candidate with
+// that candidate's model.
+func withModel(req wire.Request, model string) wire.Request {
+	if model == "" {
+		return req
+	}
+	m, err := json.Marshal(model)
+	if err != nil {
+		// A plain string always marshals; treat the impossible case as "no override".
+		return req
+	}
+	out := make(wire.Request, len(req)+1)
+	for k, v := range req {
+		out[k] = v
+	}
+	out["model"] = m
+	return out
 }
 
 // sealedFieldsFor picks the configured sealed fields that are actually present

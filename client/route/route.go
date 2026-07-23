@@ -7,12 +7,14 @@
 //
 //  1. Control plane — POST the routing-relevant fields to the 0G router's
 //     route-preview API (POST /v1/routing/preview). The router ranks its live
-//     fleet and returns an ordered provider list; the Router takes the top one.
-//     The sealed fields (the prompt) are stripped before this call, so the
-//     router still never sees plaintext.
-//  2. Provider identity — GET the chosen provider's HPKE recipient key from the
-//     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key to seal
-//     to and the signer address sealed into _e2ee.signer_addr (SPEC §4).
+//     fleet and returns an ordered candidate list (its provider-retry budget) —
+//     the fallback chain core walks. The sealed fields (the prompt) are stripped
+//     before this call, so the router still never sees plaintext.
+//  2. Provider identity — GET a candidate's HPKE recipient key from the broker's
+//     e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key to seal to and the
+//     signer address sealed into _e2ee.signer_addr (SPEC §4). This is deferred
+//     per candidate (core.Candidates.Provider): the happy path fetches only the
+//     head's key, and a fallback fetches the next candidate's key on demand.
 //
 // The resulting core.Provider seals to the chosen provider's enc key, but its
 // URL is the *router's* chat-completions endpoint, not the provider's: the
@@ -62,9 +64,12 @@ const (
 	// the router is the centralized auth/billing point; it authenticates, then
 	// forwards to the pinned provider (SPEC §4.4).
 	completionsPath = "/v1/chat/completions"
-	// DefaultType is the inference kind sent to the preview API for a chat
-	// completion.
-	DefaultType = "chat"
+	// DefaultServiceType is the service type sent to the preview API for a chat
+	// completion. It is the router's internal service-type vocabulary — the same
+	// strings GET /v1/service-types returns and GET /v1/providers?service_type=
+	// accepts — not the model modality on /v1/models. A chat-completions proxy
+	// always previews "chatbot".
+	DefaultServiceType = "chatbot"
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -82,7 +87,7 @@ const (
 type Router struct {
 	previewURL      string
 	completionsURL  string
-	reqType         string
+	serviceType     string
 	sensitiveFields map[string]struct{}
 	http            *http.Client
 	cache           *pubkeyCache
@@ -91,12 +96,14 @@ type Router struct {
 // Option customizes a Router.
 type Option func(*Router)
 
-// WithType sets the inference kind sent as the preview request's "type"
-// (default DefaultType, "chat").
-func WithType(t string) Option {
+// WithServiceType sets the service type sent as the preview request's
+// "service_type" (default DefaultServiceType, "chatbot"). It is bound to the
+// endpoint the caller serves — a chat proxy previews "chatbot" — so callers set
+// it once, not per request.
+func WithServiceType(t string) Option {
 	return func(r *Router) {
 		if t != "" {
-			r.reqType = t
+			r.serviceType = t
 		}
 	}
 }
@@ -148,7 +155,7 @@ func New(routerURL string, opts ...Option) *Router {
 	r := &Router{
 		previewURL:      base + previewPath,
 		completionsURL:  base + completionsPath,
-		reqType:         DefaultType,
+		serviceType:     DefaultServiceType,
 		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
 		http:            &http.Client{Transport: tr},
 		cache:           newPubkeyCache(defaultPubkeyTTL),
@@ -159,17 +166,43 @@ func New(routerURL string, opts ...Option) *Router {
 	return r
 }
 
-// Resolve implements core.Resolver: preview → pubkey → core.Provider. The
-// returned provider seals to the chosen provider's enc key and pins its signer,
-// but POSTs to the router's chat-completions URL — the router authenticates,
-// bills, and forwards to the pinned provider. core sets the pin header so the
-// router forwards to exactly this provider (see core's data-plane request).
-func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, error) {
-	prov, err := r.preview(ctx, req)
+// Resolve implements core.Resolver: it runs the route-preview once and returns
+// the ranked candidate list as core.Candidates. Materializing a candidate (its
+// pubkey fetch) is deferred to Candidates.Provider, so the happy path fetches
+// only the head's key; core walks the rest only on fallback.
+func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Candidates, error) {
+	providers, err := r.preview(ctx, req)
 	if err != nil {
-		return core.Provider{}, err
+		return nil, err
 	}
-	// The provider endpoint is used only to fetch its published enc key. It is
+	return &routeCandidates{router: r, providers: providers}, nil
+}
+
+// routeCandidates is the ranked preview list as a core.Candidates. It holds the
+// router (for the per-candidate pubkey fetch and the completions URL) and the
+// ordered candidates; Provider materializes one on demand.
+type routeCandidates struct {
+	router    *Router
+	providers []previewProvider
+}
+
+func (c *routeCandidates) Len() int { return len(c.providers) }
+
+// Provider materializes the i-th candidate into a core.Provider, fetching its
+// enc key from the broker (cached). It fails (so core skips to the next
+// candidate) if the candidate lacks the endpoint/address the seal + pin need.
+func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, error) {
+	prov := c.providers[i]
+	// Address is the routing pin core sends so the router forwards to exactly this
+	// provider; without it the router could re-route to a provider whose key can't
+	// open the sealed request. Skip such a candidate rather than pin to nothing.
+	if prov.Address == "" {
+		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no address"))
+	}
+	if prov.Endpoint == "" {
+		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no endpoint"))
+	}
+	// The candidate endpoint is used only to fetch its published enc key. It is
 	// taken as the router returns it; the router is untrusted, so a compromised
 	// one could point this at an endpoint it controls and MITM the prompt.
 	// Resolving the endpoint (and on-chain teeSignerAddress) from chain instead is
@@ -178,8 +211,7 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 	if err != nil {
 		return core.Provider{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
-
-	encPub, signer, err := r.pubkey(ctx, pubkeyURL)
+	encPub, signer, err := c.router.pubkey(ctx, pubkeyURL)
 	if err != nil {
 		return core.Provider{}, err
 	}
@@ -188,13 +220,17 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 	//     the crypto pin the provider enclave verifies and that signs responses.
 	//   - Address (the router's provider address) → the routing pin core sends as
 	//     X-0G-Provider-Address so the router forwards to exactly this provider.
-	// URL is the router's completions endpoint, NOT the provider's: the sealed
-	// request goes through the router for auth/billing.
+	// Model is the candidate's canonical_id, written into the sealed request's
+	// cleartext "model" so it names the model this provider serves (the preview
+	// list is heterogeneous when the caller omits "model"). URL is the router's
+	// completions endpoint, NOT the provider's: the sealed request goes through the
+	// router for auth/billing.
 	return core.Provider{
-		URL:        r.completionsURL,
+		URL:        c.router.completionsURL,
 		EncPubKey:  encPub,
 		SignerAddr: signer,
 		Address:    prov.Address,
+		Model:      prov.CanonicalID,
 	}, nil
 }
 
@@ -206,24 +242,24 @@ type previewProvider struct {
 	ModelID     string `json:"model_id"`
 }
 
-// previewResponse is the route-preview reply.
+// previewResponse is the route-preview reply. ServiceType echoes the requested
+// service_type; there is no top-level model because the candidate list is
+// heterogeneous when the caller omits "model" (each candidate carries its own).
 type previewResponse struct {
-	Object    string            `json:"object"`
-	Type      string            `json:"type"`
-	Providers []previewProvider `json:"providers"`
+	Object      string            `json:"object"`
+	ServiceType string            `json:"service_type"`
+	Providers   []previewProvider `json:"providers"`
 }
 
-// preview asks the router to rank providers for req and returns the top one. It
+// preview asks the router to rank providers for req and returns the full ordered
+// candidate list (the router's provider-retry budget — the fallback chain). It
 // sends the routing-relevant fields (the request minus the sealed fields) plus
-// the model and type, forwarding the caller's credential and X-0G-* directives
-// so the router authenticates/bills and steers exactly as it would for the
-// sealed request.
-func (r *Router) preview(ctx context.Context, req wire.Request) (previewProvider, error) {
-	model, err := modelOf(req)
-	if err != nil {
-		return previewProvider{}, err
-	}
-
+// the service_type, forwarding the caller's credential and X-0G-* directives so
+// the router authenticates/bills and steers exactly as it would for the sealed
+// request. "model" is optional and passes through when present (it is not a
+// sealed field): present → candidates are that model's providers; omitted →
+// candidates are any provider of the service type.
+func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvider, error) {
 	payload := make(map[string]json.RawMessage, len(req)+1)
 	for k, v := range req {
 		if _, sensitive := r.sensitiveFields[k]; sensitive {
@@ -231,18 +267,18 @@ func (r *Router) preview(ctx context.Context, req wire.Request) (previewProvider
 		}
 		payload[k] = v
 	}
-	// Force the inference kind the gateway is configured for; a chat body carries
-	// no "type" of its own, and the router needs it to route.
-	typeJSON, _ := json.Marshal(r.reqType)
-	payload["type"] = typeJSON
+	// Force the service type the gateway is configured for; a chat body carries no
+	// service_type of its own, and the router needs it to route.
+	serviceTypeJSON, _ := json.Marshal(r.serviceType)
+	payload["service_type"] = serviceTypeJSON
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return previewProvider{}, upstream(0, fmt.Errorf("marshal preview request: %w", err))
+		return nil, upstream(0, fmt.Errorf("marshal preview request: %w", err))
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.previewURL, bytes.NewReader(body))
 	if err != nil {
-		return previewProvider{}, upstream(0, err)
+		return nil, upstream(0, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Forward routing directives first, then the credential, so the credential
@@ -258,39 +294,31 @@ func (r *Router) preview(ctx context.Context, req wire.Request) (previewProvider
 
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return previewProvider{}, upstream(0, fmt.Errorf("route preview request: %w", err))
+		return nil, upstream(0, fmt.Errorf("route preview request: %w", err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
 	if err != nil {
-		return previewProvider{}, upstream(0, fmt.Errorf("read route preview response: %w", err))
+		return nil, upstream(0, fmt.Errorf("read route preview response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Surface the router's status verbatim (401/404/503 are meaningful to the
 		// caller) but not its raw body — this error becomes the gateway's response.
-		return previewProvider{}, upstream(resp.StatusCode, fmt.Errorf("route preview returned %d", resp.StatusCode))
+		return nil, upstream(resp.StatusCode, fmt.Errorf("route preview returned %d", resp.StatusCode))
 	}
 
 	var pr previewResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
-		return previewProvider{}, upstream(0, fmt.Errorf("decode route preview response: %w", err))
+		return nil, upstream(0, fmt.Errorf("decode route preview response: %w", err))
 	}
 	if len(pr.Providers) == 0 {
-		return previewProvider{}, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for model %q", model))
+		return nil, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for %s", modelDesc(req)))
 	}
-	// The router returns candidates ranked best-first; take the top one. (A
-	// client-side fallback loop over the rest is a later step — SPEC §4.4.)
-	top := pr.Providers[0]
-	if top.Endpoint == "" {
-		return previewProvider{}, upstream(0, fmt.Errorf("route preview returned a provider with no endpoint"))
-	}
-	// Address is the routing pin core sends so the router forwards to exactly this
-	// provider; without it the router could re-route to a provider whose key
-	// can't open the sealed request.
-	if top.Address == "" {
-		return previewProvider{}, upstream(0, fmt.Errorf("route preview returned a provider with no address"))
-	}
-	return top, nil
+	// The router returns candidates ranked best-first; core pins the head and
+	// falls back down the rest (SPEC §4.4). Per-candidate validation is deferred
+	// to routeCandidates.Provider so a single malformed candidate is skipped, not
+	// fatal to the whole list.
+	return pr.Providers, nil
 }
 
 // pubkeyResponse is the broker's /v1/e2ee/pubkey reply.
@@ -386,17 +414,20 @@ func derivePubkeyURL(endpoint string) (string, error) {
 	return u.Scheme + "://" + u.Host + base + "/e2ee/pubkey", nil
 }
 
-// modelOf extracts the required, non-empty "model" from req.
-func modelOf(req wire.Request) (string, error) {
+// modelDesc describes what was previewed for a "no provider available" error.
+// "model" is optional on this path (matching the execute path): present → the
+// message names it; omitted → the preview asked for any provider of the service
+// type, so there is no model to name.
+func modelDesc(req wire.Request) string {
 	raw, ok := req["model"]
 	if !ok {
-		return "", &core.Error{Stage: core.StageRequest, Err: fmt.Errorf(`request has no "model" to route on`)}
+		return "the requested service type"
 	}
 	var model string
 	if err := json.Unmarshal(raw, &model); err != nil || model == "" {
-		return "", &core.Error{Stage: core.StageRequest, Err: fmt.Errorf(`"model" must be a non-empty string`)}
+		return "the requested service type"
 	}
-	return model, nil
+	return fmt.Sprintf("model %q", model)
 }
 
 // upstream wraps err as a StageUpstream *core.Error, carrying status so the
