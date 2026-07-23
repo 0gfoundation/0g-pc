@@ -113,7 +113,7 @@ by the transport crypto — so nothing security-relevant may depend on them.
 | `provider_id` | The pinned recipient's on-chain signer address (`0x…`). Client asserts "I sealed to *this* provider/gateway." | Recipient checks `provider_id == self`; a router cannot silently reroute to another provider. **Bound.** |
 | `client_eph_pub` | Client's **ephemeral** X25519 public key; the enclave seals the **response** to it (§7). | Stored at request time, used at response time. **Must be bound** — else a MITM swaps its own key and reads the response. |
 | `enc` | HPKE **encapsulated key** (sender's ephemeral KEM output). Recipient derives the shared secret from `enc` + its private key. | **Bound.** |
-| `sealed_fields` | **Allowlist** of which fields were encrypted. After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. |
+| `sealed_fields` | **Allowlist** of which fields were encrypted. After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. D6 🆕 flips the *default*: seal all except a declared `visible_fields` set (this list stays as the post-`Open` check). |
 | `unbound_fields` 🆕 | **Denylist** of cleartext fields intermediaries may add/modify/remove; these are **excluded from the AAD**. Everything else (except `ciphertext`) is bound by default. | The **list itself is bound** (it lives in `_e2ee`), so a router cannot enlarge it. Must be disjoint from `sealed_fields`. |
 | `ciphertext` | AEAD output (sealed body + tag), base64url. | The one field **always** excluded from the AAD (can't bind the ciphertext into its own AAD). |
 
@@ -139,6 +139,16 @@ D3 generalizes the exclusion to also drop the declared unbound set.
 ---
 
 ## 4. Decisions
+
+### D0 — the router is blind to prompt & completion by default 🆕
+The seal boundary is **client ↔ provider enclave**; the router is a blind
+forwarder that reads only the cleartext manifest and never the prompt or the
+completion. This is the framing decision the rest depend on. Consequence: any
+feature that must read/rewrite prompt or completion content — web-search
+injection, file/attachment expansion, response `model`/annotation/`reasoning`
+rewriting — does **not** run at the router. It moves either client-side (before
+seal / after open) or to a dedicated attested TEE node. The router keeps only
+routing, billing off cleartext manifest + response `usage`, and provider auth.
 
 ### D1 — the §8 content hash binds produced/decrypted bytes, not a re-derived canonical form 🆕
 The plaintext body is JCS-canonicalized today only to feed the §8 signature hash;
@@ -177,11 +187,37 @@ party that folds it in is inside the TEE and it rides inside the **signed**
 response (or is settled on-chain) — the AAD gives it no protection.
 
 ### D5 — the response envelope mirrors D3/D4 🆕
-The router also rewrites the **response** (injects `x_0g_trace`, url-citation
-annotations, rewrites `model`, mirrors `reasoning`→`reasoning_content`). The
-response `_e2ee` therefore needs the same `unbound_fields` denylist, declaring
-exactly what an intermediary may touch on the return path. Same red line: the
-list is bound; unbound response fields are untrusted unless signed.
+The response `_e2ee` needs the same `unbound_fields` denylist, declaring exactly
+what an intermediary may touch on the return path (e.g. an injected
+`x_0g_trace`). Same red line: the list is bound; unbound response fields are
+untrusted unless signed. Note that under D0 the router does **not** rewrite
+response *content* (`model`, annotations, `reasoning` mirroring); any such
+transform moves inside the trust boundary — the denylist is for genuinely
+intermediary-owned metadata only.
+
+### D6 — seal by default; declare an explicit *visible* allowlist (fail-closed confidentiality) 🆕
+The mirror of D3, for confidentiality. Today `sealed_fields` is an allowlist of
+what gets **encrypted**, so unknown/new fields default to **cleartext** —
+fail-*open*, a silent leak (a future `user` / `metadata` field carrying PII).
+Flip it: the sealed set is the **complement of a declared `visible_fields`
+allowlist**, computed over the fields actually present, so anything not
+explicitly exposed is sealed — including fields this client version has never
+heard of. Guard: `messages` may never appear in `visible_fields`.
+
+The router's visible set is minimal: routing needs `model`; the gateway needs
+`stream`; billing keys off the response `usage`, not request params — so
+`temperature`, `max_tokens`, `top_p`, `stop`, `user`, `metadata`, … can all be
+sealed. Err toward sealing: forgetting to expose a needed field breaks routing
+loudly (fail-closed), never leaks. (`sealed_fields` may stay on the wire as the
+post-`Open` integrity check, but the *default* is now defined by `visible_fields`
+— encoding detail for SPEC.)
+
+Secure-default summary — two mirror-image declarations:
+
+| Dimension | Declares | Default | A new/unknown field is |
+|---|---|---|---|
+| Confidentiality (D6) | `visible_fields` (who the router sees) | seal all | sealed (safe) |
+| Integrity (D3) | `unbound_fields` (who may mutate) | bind all | bound (safe) |
 
 ---
 
@@ -204,11 +240,11 @@ list is bound; unbound response fields are untrusted unless signed.
 
 Beyond the field model above, these deserve a decision (some already tracked):
 
-- **The seal boundary itself (the meta-decision).** Because the router reads and
-  rewrites prompts/completions (search/file injection, model rewrite), the
-  operative confidentiality boundary today is client↔router, not client↔provider.
-  Whether that boundary is *attestable* (cloud-TEE gateway) drives every field
-  decision above. See `router-e2e.md` §"Trust boundary by location". **Unresolved.**
+- **The seal boundary (meta-decision) — RESOLVED as D0:** router blind by
+  default, seal boundary is client↔provider. The consequence to still execute is
+  *relocating* the router's content-touching features (search/file injection,
+  response content rewrites) off the routing layer — to the client or a dedicated
+  attested TEE node. Tracked as follow-up work, not a protocol-format question.
 - **Forward secrecy of requests.** Requests are sealed to the provider's *static*
   enc key (HPKE base mode). Compromise of that key (or the enclave) retroactively
   exposes all captured requests. Mitigation: measurement-tied key rotation with a
