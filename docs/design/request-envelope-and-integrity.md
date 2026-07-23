@@ -204,13 +204,28 @@ allowlist**, computed over the fields actually present, so anything not
 explicitly exposed is sealed — including fields this client version has never
 heard of. Guard: `messages` may never appear in `visible_fields`.
 
-The router's visible set is minimal: routing needs `model`; the gateway needs
-`stream`; billing keys off the response `usage`, not request params — so
-`temperature`, `max_tokens`, `top_p`, `stop`, `user`, `metadata`, … can all be
-sealed. Err toward sealing: forgetting to expose a needed field breaks routing
-loudly (fail-closed), never leaks. (`sealed_fields` may stay on the wire as the
-post-`Open` integrity check, but the *default* is now defined by `visible_fields`
+The router routes on the **generation parameters** (the fleet is heterogeneous —
+not every machine supports every param), so `visible_fields` is not small: it
+includes `model`, `temperature`, `max_tokens`, `top_p`, `stop`, `stream`,
+`response_format`, … The sealed set is therefore the **content** (`messages`,
+`tools`) plus any **non-routing / user-identifying** field (`user`, `metadata`,
+and — the real point — any field this client version does not yet know about).
+
+So D6's practical effect is **narrow and honest**: it does *not* seal more of the
+known routing params (those are legitimately visible); it flips the *default* for
+the sensitive/unknown remainder from cleartext to sealed, closing the PII-leak
+path (a future `user`/`metadata`) that today's `sealed_fields` allowlist leaves
+open. Err toward sealing: forgetting to expose a needed routing param breaks
+routing loudly (fail-closed), never leaks. (`sealed_fields` may stay on the wire
+as the post-`Open` integrity check; the *default* is defined by `visible_fields`
 — encoding detail for SPEC.)
+
+**Read ≠ mutate.** A visible param is still **bound** (category ②): the router
+reads it to route but may not rewrite it — else it could downgrade your sampling
+or cap `max_tokens` undetectably. A field the router genuinely *rewrites* today
+(e.g. forcing `stream_options.include_usage=true`) must therefore be either
+listed in `unbound_fields` (low-stakes, untrusted) or — cleaner — set by the
+client up front so no rewrite is needed.
 
 Secure-default summary — two mirror-image declarations:
 
