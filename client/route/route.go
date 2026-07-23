@@ -143,6 +143,11 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 	if err != nil {
 		return core.Provider{}, err
 	}
+	// The endpoint is taken as the router returns it. The router is untrusted, so
+	// a compromised one could point this at an endpoint it controls and MITM the
+	// prompt; resolving the endpoint (and on-chain teeSignerAddress) from chain
+	// instead is tracked in issue #18, and full protection needs quote
+	// verification (issue #7).
 	completionsURL, pubkeyURL, err := deriveURLs(prov.Endpoint)
 	if err != nil {
 		return core.Provider{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))

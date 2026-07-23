@@ -276,14 +276,18 @@ does not.
   uses, or a dedicated transparency log?
 - ~~Does the gateway pin one provider per request (like the sidecar) or offer
   provider selection to the 0-code client via a request field/header?~~
-  **Resolved (initial):** the gateway supports both, chosen at startup. *Pin
-  mode* seals every request to one configured provider (like the sidecar);
-  *route mode* (`-route`, `client/route`) picks a provider per request by asking
-  the router's route-preview API (`POST /v1/routing/preview`) and fetching the
-  chosen provider's enc key from the broker (`GET /v1/e2ee/pubkey`) — the sealed
-  fields are withheld from the preview call, so the prompt stays confidential.
-  Client-side fallback over the remaining candidates, and verifying the enc key
-  out of an attestation quote, remain later steps.
+  **Resolved:** the gateway always routes (`client/route`). Per request it asks
+  the router's route-preview API (`POST /v1/routing/preview`) which provider to
+  use, then fetches that provider's enc key **and** signer address from the
+  broker (`GET /v1/e2ee/pubkey`) — so nothing about the provider (endpoint, enc
+  key, signer) is configured up front. The sealed fields are withheld from the
+  preview call, so the prompt stays confidential. A caller selects a specific
+  provider by setting the `X-0G-Provider-Address` routing header, which the
+  gateway forwards to the router so preview returns that provider (this replaces
+  a separate "pin/direct" mode). Client-side fallback over the remaining
+  candidates, verifying the enc key out of an attestation quote, and resolving
+  the provider **endpoint on chain** rather than trusting the router's reply are
+  later steps (the last tracked in issue #18).
 - Streaming through the in-enclave TLS + L4 LB — confirm no buffering is
   introduced on the dstack path (the sidecar already sets `X-Accel-Buffering:
   no`; the router's nginx sets `proxy_buffering off`).

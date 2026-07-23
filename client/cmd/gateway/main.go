@@ -2,26 +2,24 @@
 // as a server, but SERVER-RUN and 0G-operated — it runs inside an attested CVM
 // and adds one attested trust party. It serves no-install / browser / thin
 // clients that cannot run a sidecar: TLS terminates inside the enclave (dstack
-// ZT-HTTPS), the gateway seals each request to the pinned provider and opens the
+// ZT-HTTPS), the gateway seals each request to the routed provider and opens the
 // sealed response, and plaintext streams back over that same TLS. See
 // docs/design/cloud-gateway.md for the trust model.
 //
-// The gateway has two provider-selection modes:
-//
-//   - Pin (default): seal every request to one flag-configured provider
-//     (-provider-enc-key / -provider-signer), like the sidecar. Design §10 step
-//     1.
-//   - Route (-route): per request, ask the 0G router which provider to use
-//     (POST /v1/routing/preview) and fetch that provider's enc key from the
-//     broker (GET /v1/e2ee/pubkey), then seal to it — centralizing routing for
-//     0-code clients (design §12 open question 3). See client/route.
+// The gateway always routes: per request it asks the 0G router which provider to
+// use (POST /v1/routing/preview), fetches that provider's enc key and signer
+// address from the broker (GET /v1/e2ee/pubkey), then seals to it — so no
+// provider key or signer is configured up front (design §12 open question 3;
+// see client/route). A caller that wants a specific provider pins it with the
+// X-0G-Provider-Address routing header, which the gateway forwards to the router
+// so preview returns that provider.
 //
 // Attestation (the /quote body and per-response signature, protocol/attest /
-// issue #7) is a later step; /quote is a stub until then.
+// issue #7) is a later step; /quote is a stub until then. Trusting the router's
+// returned endpoint (vs resolving it on chain) is tracked in issue #18.
 package main
 
 import (
-	"encoding/base64"
 	"flag"
 	"log"
 	"net/http"
@@ -31,18 +29,13 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 func main() {
 	listen := flag.String("listen", ":8443", "address to listen on")
-	providerURL := flag.String("provider-url", core.DefaultProviderURL, "pin mode: provider (router/broker) OpenAI chat-completions endpoint")
-	encPubB64 := flag.String("provider-enc-key", "", "pin mode: provider HPKE public key, base64url (attestation stub)")
-	signer := flag.String("provider-signer", "", "pin mode: provider on-chain signer address (0x...)")
-	routeMode := flag.Bool("route", false, "route mode: pick the provider per request via the router's route-preview API instead of pinning one")
-	previewURL := flag.String("router-preview-url", route.DefaultPreviewURL, "route mode: router route-preview endpoint (POST)")
-	routeType := flag.String("route-type", route.DefaultType, "route mode: inference kind sent to the route-preview API")
+	previewURL := flag.String("router-preview-url", route.DefaultPreviewURL, "router route-preview endpoint (POST)")
+	routeType := flag.String("route-type", route.DefaultType, "inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
 
@@ -51,33 +44,15 @@ func main() {
 		log.Fatalf("invalid -seal-fields: %v", err)
 	}
 
-	var client *core.Client
-	var target string
-	if *routeMode {
-		// Route mode chooses the provider per request; no provider is pinned. The
-		// router is told to withhold exactly the sealed fields, so the prompt never
-		// reaches it in cleartext even on the control-plane call.
-		router := route.New(*previewURL,
-			route.WithType(*routeType),
-			route.WithSensitiveFields(sealFields),
-		)
-		client = core.NewWithResolver(router, core.WithSealFields(sealFields))
-		target = "route via " + *previewURL
-	} else {
-		if *encPubB64 == "" || *signer == "" {
-			log.Fatal("pin mode requires -provider-enc-key and -provider-signer (or pass -route)")
-		}
-		encPub, err := base64.RawURLEncoding.DecodeString(*encPubB64)
-		if err != nil {
-			log.Fatalf("bad provider-enc-key: %v", err)
-		}
-		client = core.New(core.Provider{
-			URL:        *providerURL,
-			EncPubKey:  crypto.PublicKey(encPub),
-			SignerAddr: *signer,
-		}, core.WithSealFields(sealFields))
-		target = *providerURL
-	}
+	// The gateway holds no pinned provider: it routes per request and derives the
+	// provider's enc key + signer from the broker. The router is told to withhold
+	// exactly the sealed fields, so the prompt never reaches it in cleartext even
+	// on the control-plane preview call.
+	router := route.New(*previewURL,
+		route.WithType(*routeType),
+		route.WithSensitiveFields(sealFields),
+	)
+	client := core.NewWithResolver(router, core.WithSealFields(sealFields))
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -87,7 +62,7 @@ func main() {
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
-	log.Printf("gateway listening on %s -> %s", *listen, target)
+	log.Printf("gateway listening on %s -> route via %s", *listen, *previewURL)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

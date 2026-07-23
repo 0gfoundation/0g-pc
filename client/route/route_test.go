@@ -93,6 +93,7 @@ type mockRouter struct {
 	srv         *httptest.Server
 	lastPreview map[string]json.RawMessage
 	lastAuth    string
+	lastHeaders http.Header
 	status      int // override response status; 0 = 200
 	noProviders bool
 }
@@ -104,6 +105,7 @@ func newMockRouter(t *testing.T, brokerEndpoint string) *mockRouter {
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &m.lastPreview)
 		m.lastAuth = r.Header.Get("Authorization")
+		m.lastHeaders = r.Header.Clone()
 		if m.status != 0 {
 			http.Error(w, "boom", m.status)
 			return
@@ -165,6 +167,24 @@ func TestResolveEndToEnd(t *testing.T) {
 	}
 	if router.lastAuth != "Bearer sk-test" {
 		t.Errorf("credential not forwarded to router: %q", router.lastAuth)
+	}
+}
+
+// A caller pins a specific provider with the X-0G-Provider-Address routing
+// header; the resolver forwards it to the preview call so the router returns
+// that provider. This is how "direct" provider selection works now that the
+// gateway is route-only.
+func TestPreviewForwardsRoutingHeaders(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker.srv.URL)
+
+	pin := http.Header{"X-0g-Provider-Address": []string{testSigner}}
+	ctx := core.WithForwardedHeaders(context.Background(), pin)
+	if _, err := New(router.srv.URL).Resolve(ctx, chatReq()); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := router.lastHeaders.Get("X-0g-Provider-Address"); got != testSigner {
+		t.Errorf("pin header not forwarded to preview: got %q, want %q", got, testSigner)
 	}
 }
 
