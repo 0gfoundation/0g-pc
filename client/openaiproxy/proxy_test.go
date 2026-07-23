@@ -40,7 +40,7 @@ func mockBroker(t *testing.T, encPriv crypto.PrivateKey, signer string) *httptes
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if e2ee.ProviderID != signer {
+		if e2ee.SignerAddr != signer {
 			http.Error(w, "wrong provider pin", http.StatusBadRequest)
 			return
 		}
@@ -184,6 +184,48 @@ func TestProxyPassesUpstreamStatus(t *testing.T) {
 	defer httpResp.Body.Close()
 	if httpResp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("got %d, want 429 (upstream status passed through)", httpResp.StatusCode)
+	}
+}
+
+// The raw upstream body is untrusted content. By default (the gateway's mode)
+// the proxy must NOT echo it back; with WithVerboseUpstreamErrors (the sidecar's
+// mode) it may, for local debugging. The status passes through in both cases.
+func TestProxyDoesNotLeakUpstreamBody(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+	const secret = "internal-upstream-secret-detail"
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, secret, http.StatusBadGateway)
+	}))
+	defer broker.Close()
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	post := func(h http.Handler) (int, string) {
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	// Default: body must be hidden.
+	if status, body := post(openaiproxy.Handler(client)); status != http.StatusBadGateway {
+		t.Errorf("default: got status %d, want 502", status)
+	} else if strings.Contains(body, secret) {
+		t.Errorf("default: upstream body leaked to client: %s", body)
+	}
+
+	// Verbose: body may be surfaced (sidecar debugging).
+	if status, body := post(openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors())); status != http.StatusBadGateway {
+		t.Errorf("verbose: got status %d, want 502", status)
+	} else if !strings.Contains(body, secret) {
+		t.Errorf("verbose: upstream body not surfaced: %s", body)
 	}
 }
 
@@ -669,8 +711,17 @@ func TestProxyForwardsRoutingHeaders(t *testing.T) {
 
 	// HTTP header names are case-insensitive; http.Header.Get canonicalizes, so
 	// these match regardless of the wire casing.
+	//
+	// This client is pin-only (core.New, no Provider.Address), so core sets no
+	// routing pin and the client-supplied X-0G-Provider-Address passes through
+	// unchanged. (In route mode, where Provider.Address is set, core would pin it.)
 	if v := got.Get("X-0G-Provider-Address"); v != "0x"+strings.Repeat("b", 40) {
 		t.Errorf("X-0G-Provider-Address = %q, want it forwarded", v)
+	}
+	// Fallback is forced off whenever we seal (a sealed request can be opened only
+	// by the one provider it is sealed to).
+	if v := got.Get("X-0G-Allow-Fallbacks"); v != "false" {
+		t.Errorf("X-0G-Allow-Fallbacks = %q, want %q", v, "false")
 	}
 	if v := got.Get("X-0G-Provider-Sort"); v != "latency" {
 		t.Errorf("X-0G-Provider-Sort = %q, want %q", v, "latency")

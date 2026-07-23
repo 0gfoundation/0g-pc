@@ -1,14 +1,18 @@
 // Command sidecar is the local sidecar form: the client core wrapped as a
 // localhost OpenAI-compatible proxy. Run it and point any OpenAI SDK at it via
-// base_url; it seals the sensitive request fields to the provider and opens the
-// sealed response, so your app keeps talking plain OpenAI.
+// base_url; it routes each request through the 0G router, seals the sensitive
+// request fields to the chosen provider, and opens the sealed response, so your
+// app keeps talking plain OpenAI.
 //
-// The provider's encryption key and signer address are passed in as flags for
-// now (attestation — verifying them out of a TEE quote — is a later step).
+// Like the gateway, the sidecar is route-oriented: per request it asks the
+// router which provider to use (POST /v1/routing/preview) and fetches that
+// provider's enc key + signer from the broker (GET /v1/e2ee/pubkey), so no
+// provider key is configured up front. Unlike the gateway it runs on the user's
+// own machine (no new trust party) and surfaces upstream error detail for local
+// debugging.
 package main
 
 import (
-	"encoding/base64"
 	"flag"
 	"log"
 	"net/http"
@@ -17,41 +21,40 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 func main() {
 	listen := flag.String("listen", "localhost:8787", "address to listen on")
-	providerURL := flag.String("provider-url", core.DefaultProviderURL, "provider (router/broker) OpenAI chat-completions endpoint")
-	encPubB64 := flag.String("provider-enc-key", "", "provider HPKE public key, base64url (attestation stub)")
-	signer := flag.String("provider-signer", "", "provider on-chain signer address (0x...)")
+	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
+	routeType := flag.String("route-type", route.DefaultType, "inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
 
-	if *encPubB64 == "" || *signer == "" {
-		log.Fatal("provider-enc-key and provider-signer are required")
-	}
-	encPub, err := base64.RawURLEncoding.DecodeString(*encPubB64)
-	if err != nil {
-		log.Fatalf("bad provider-enc-key: %v", err)
-	}
 	sealFields := parseCSV(*sealFieldsCSV)
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
 		log.Fatalf("invalid -seal-fields: %v", err)
 	}
 
-	client := core.New(core.Provider{
-		URL:        *providerURL,
-		EncPubKey:  crypto.PublicKey(encPub),
-		SignerAddr: *signer,
-	}, core.WithSealFields(sealFields))
+	// Route per request: pick the provider via the router and derive its enc key
+	// from the broker. The router is told to withhold exactly the sealed fields,
+	// so the prompt never reaches it in cleartext on the preview call.
+	router := route.New(*routerURL,
+		route.WithType(*routeType),
+		route.WithSensitiveFields(sealFields),
+	)
+	client := core.NewWithResolver(router, core.WithSealFields(sealFields))
+
 	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           openaiproxy.Handler(client),
+		Addr: *listen,
+		// Single-user and local, so surfacing the raw upstream body in errors aids
+		// debugging and never leaves the user's machine (localhost); the gateway
+		// deliberately does not do this.
+		Handler:           openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors()),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
-	log.Printf("sidecar listening on %s -> %s", *listen, *providerURL)
+	log.Printf("sidecar listening on %s -> route via %s", *listen, *routerURL)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
