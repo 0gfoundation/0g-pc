@@ -16,17 +16,25 @@ runs determines the trust boundary — not just the deployment target.**
 | New trust party | none | one (must be attested) |
 | Plaintext lands on | the user's own machine | 0G's TEE (in-enclave) |
 | Attestation of the client component | not needed (user owns it) | required (else it degrades to today's plaintext L7 router) |
-| Routing / fallback | driven locally | centralized in the gateway (decrypt + re-seal) |
+| Provider selection | via the 0G router (route-preview), per request | via the 0G router (route-preview), per request |
+| Plaintext handling | seals its own request | decrypts the client's plaintext, then re-seals to the provider |
 | Best for | clients that can run software; max privacy | clients that cannot (browser / thin / no-install) |
+
+> Both server forms are **route-oriented**: they call the router's route-preview
+> to select the provider and fetch its enc key per request (this doc originally
+> envisioned the sidecar routing purely locally; it now uses the same router
+> control plane as the gateway). The difference is *where the plaintext lands*
+> and whether the component must be attested — not who drives routing.
 
 **A cloud gateway does not remove client-side crypto.** The user→gateway hop
 still needs securing (RA-TLS or app-layer seal to the gateway), so the client
 must still verify the gateway's quote and seal to it. If the client can do that,
-it could seal to the broker directly — so the gateway's only added value is
-centralizing routing + fallback, or serving clients that cannot run a sidecar.
-Trusting the gateway *without* attestation reduces it to today's plaintext L7
-router (no privacy). There is no free lunch: cloud privacy requires attesting the
-cloud component.
+it could seal to the broker directly — so, since both forms route through the
+same router control plane, the gateway's added value is **handling the client's
+plaintext in an attested TEE** for clients that cannot run a sidecar (browser /
+thin / no-install), not centralizing routing. Trusting the gateway *without*
+attestation reduces it to today's plaintext L7 router (no privacy). There is no
+free lunch: cloud privacy requires attesting the cloud component.
 
 ### Packaging forms (one core, several shells)
 
@@ -110,10 +118,12 @@ Backward compatible; sealed mode is opt-in ("privacy mode").
 1. **Groundwork:** broker publishes an encryption pubkey in the quote; add the
    control-plane candidate endpoint on the router (metadata in → ranked list +
    quotes out). No client change yet.
-2. **Sidecar seal + pin (i-a):** sidecar seals the body, sends with
-   `pin, allow_fallbacks=false`; the L7 router re-auths as itself, bills its
-   account, honors the pin, and forwards without re-routing. Fallback loop in the
-   sidecar. (Data-plane bypass — i-b/ii — is a later, voucher-gated step.)
+2. **Route + seal + pin (i-a):** the client (sidecar or gateway) calls the
+   router's route-preview to select a provider and fetch its enc key, seals the
+   body, and sends with `pin, allow_fallbacks=false`; the L7 router authenticates,
+   honors the pin, and forwards without re-routing. A client-side fallback loop
+   over the remaining candidates is a later step. (Data-plane bypass — i-b/ii —
+   is a later, voucher-gated step.)
 3. **Response-direction sealing.** Under i-a the router terminates TLS on the
    return path too, so a sealed *request* with a plaintext *response* is
    asymmetric — the router still reads the completion. Seal the response to a
@@ -170,8 +180,9 @@ rotation and CDN multi-cert fronting; only an optional secondary check.
 - Router (`api/inference/integration/router/`) — add the control-plane candidate
   endpoint; honor `pin` / `allow_fallbacks=false`; forward the sealed body
   opaquely.
-- New: local sidecar (OpenAI-compatible localhost proxy) — the client-side home
-  for select/verify/seal/pin/fallback/verify-response and the key cache.
+- New: local sidecar and cloud gateway (OpenAI-compatible proxies over the shared
+  client core) — route via the router's route-preview, then verify/seal/pin/
+  verify-response with the key cache. Client-side fallback is a later step.
 
 ---
 
