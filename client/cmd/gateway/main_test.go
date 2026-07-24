@@ -81,12 +81,13 @@ func TestGatewayRouteMode(t *testing.T) {
 	routerMux := http.NewServeMux()
 	routerMux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"object": "routing.preview",
-			"type":   "chat",
+			"object":       "routing.preview",
+			"service_type": "chatbot",
 			"providers": []map[string]string{{
-				"address":  providerAddr,
-				"endpoint": broker.URL,
-				"model_id": "gpt-4o",
+				"address":      providerAddr,
+				"canonical_id": "gpt-4o",
+				"endpoint":     broker.URL,
+				"model_id":     "gpt-4o",
 			}},
 		})
 	})

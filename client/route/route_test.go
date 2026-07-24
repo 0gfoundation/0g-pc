@@ -83,9 +83,15 @@ type mockRouter struct {
 	lastAuth        string
 	lastHeaders     http.Header
 	lastChatHeaders http.Header
-	status          int    // override preview response status; 0 = 200
-	noProviders     bool   // preview returns no providers
-	previewAddress  string // provider address in preview (default testSigner)
+	lastChatModel   string            // cleartext "model" the data-plane request carried
+	status          int               // override preview response status; 0 = 200
+	noProviders     bool              // preview returns no providers
+	previewAddress  string            // head provider's address in preview (default testProviderAddr)
+	extra           []previewProvider // extra candidates appended after the head
+	failPin         string            // data plane fails for this X-0G-Provider-Address pin
+	failStatus      int               // status returned for failPin (0 = 503)
+	badBodyPin      string            // data plane returns 200 with an unopenable body for this pin
+	truncBodyPin    string            // data plane returns 200 then truncates the body mid-read for this pin
 }
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
@@ -108,13 +114,14 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			Endpoint:    broker.srv.URL,
 			ModelID:     "gpt-4o@v1",
 		}}
+		providers = append(providers, m.extra...)
 		if m.noProviders {
 			providers = nil
 		}
 		_ = json.NewEncoder(w).Encode(previewResponse{
-			Object:    "routing.preview",
-			Type:      "chat",
-			Providers: providers,
+			Object:      "routing.preview",
+			ServiceType: "chatbot",
+			Providers:   providers,
 		})
 	})
 
@@ -123,6 +130,34 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	// key and seals a canned answer back.
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		m.lastChatHeaders = r.Header.Clone()
+		pin := r.Header.Get("X-0G-Provider-Address")
+		// Simulate a provider failure at the data plane: on a retryable status the
+		// client should re-seal to the next candidate; on a 4xx it should fail fast.
+		if m.failPin != "" && pin == m.failPin {
+			status := m.failStatus
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "provider failure", status)
+			return
+		}
+		// Simulate a 200 whose sealed body cannot be opened: the client should fall
+		// back (nothing was delivered to the caller yet).
+		if m.badBodyPin != "" && pin == m.badBodyPin {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"not":"a sealed response"}`))
+			return
+		}
+		// Simulate a 200 whose body drops mid-read: promise more bytes than we send,
+		// then return so the connection closes — the client's read fails with an
+		// unexpected EOF and should fall back.
+		if m.truncBodyPin != "" && pin == m.truncBodyPin {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"partial":`))
+			return
+		}
 		body, _ := io.ReadAll(r.Body)
 		var env wire.Request
 		if err := json.Unmarshal(body, &env); err != nil {
@@ -134,6 +169,7 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			http.Error(w, "prompt not sealed", http.StatusBadRequest)
 			return
 		}
+		_ = json.Unmarshal(env["model"], &m.lastChatModel)
 		e2ee, err := env.E2EE()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -145,8 +181,11 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			http.Error(w, "wrong provider pin (signer_addr)", http.StatusBadRequest)
 			return
 		}
-		if got := r.Header.Get("X-0G-Provider-Address"); got != testProviderAddr {
-			t.Errorf("routing pin header = %q, want provider address %q", got, testProviderAddr)
+		// A routing pin must always be set (so the router forwards to exactly the
+		// sealed-to provider); the exact address varies across candidates on
+		// fallback, so tests assert the specific value via lastChatHeaders.
+		if got := r.Header.Get("X-0G-Provider-Address"); got == "" {
+			t.Error("data-plane request carried no routing pin")
 		}
 		if _, err := wire.OpenRequest(broker.encPriv, env); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -193,6 +232,17 @@ func chatReq() wire.Request {
 	}
 }
 
+// resolveHead runs Resolve and materializes the head candidate — the "preview +
+// fetch the chosen provider's pubkey" the resolver's single Resolve used to do
+// before per-candidate materialization was deferred for fallback.
+func resolveHead(ctx context.Context, r *Router, req wire.Request) (core.Provider, error) {
+	cands, err := r.Resolve(ctx, req)
+	if err != nil {
+		return core.Provider{}, err
+	}
+	return cands.Provider(ctx, 0)
+}
+
 // End to end: a core client using the route resolver previews, fetches the
 // provider key, seals, and gets plaintext back — with the prompt never reaching
 // either the router or the broker in cleartext.
@@ -218,11 +268,19 @@ func TestResolveEndToEnd(t *testing.T) {
 	if _, ok := router.lastPreview["model"]; !ok {
 		t.Error("preview call omitted the model")
 	}
-	if typ := string(router.lastPreview["type"]); typ != `"chat"` {
-		t.Errorf("preview type = %s, want \"chat\"", typ)
+	if st := string(router.lastPreview["service_type"]); st != `"chatbot"` {
+		t.Errorf("preview service_type = %s, want \"chatbot\"", st)
+	}
+	if _, leaked := router.lastPreview["type"]; leaked {
+		t.Error("preview sent legacy \"type\" field instead of \"service_type\"")
 	}
 	if router.lastAuth != "Bearer sk-test" {
 		t.Errorf("credential not forwarded to router: %q", router.lastAuth)
+	}
+	// The data-plane request names the head candidate's canonical_id, not the
+	// caller's "gpt-4o" — the router preview's canonical_id is authoritative.
+	if router.lastChatModel != "canon-1" {
+		t.Errorf("data-plane model = %q, want canonical_id \"canon-1\"", router.lastChatModel)
 	}
 
 	// The data-plane chat request went to the router (not the broker) and pinned
@@ -279,6 +337,175 @@ func TestResolveStreamingEndToEnd(t *testing.T) {
 	}
 }
 
+// Client-side fallback: the head candidate's provider is unavailable at the data
+// plane, so the client re-seals to the second candidate (its own canonical_id,
+// enc key) and retries — and gets plaintext back.
+func TestCompleteFallsBackToNextCandidate(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr // the head candidate fails
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back and succeeded: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	// The request that succeeded was pinned+sealed to the second candidate.
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("succeeded pin = %q, want fallback address %q", got, secondAddr)
+	}
+	if router.lastChatModel != "canon-2" {
+		t.Errorf("data-plane model = %q, want fallback canonical_id \"canon-2\"", router.lastChatModel)
+	}
+}
+
+// A 4xx from the head provider is a client fault that would recur on every
+// candidate, so the client fails fast and does NOT fall back.
+func TestCompleteDoesNotFallBackOn4xx(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr
+	router.failStatus = http.StatusBadRequest
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	_, err := client.Complete(context.Background(), chatReq())
+	// The 400 is surfaced verbatim; a fallback would have hit the (healthy) second
+	// candidate and returned success instead.
+	assertStageStatus(t, err, core.StageUpstream, http.StatusBadRequest)
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
+		t.Errorf("stopped at pin %q, want head %q (no fallback)", got, testProviderAddr)
+	}
+}
+
+// A 200 whose sealed body cannot be opened is a provider fault with nothing yet
+// returned to the caller, so the client falls back to the next candidate.
+func TestCompleteFallsBackOnUnopenableResponse(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.badBodyPin = testProviderAddr // head returns a 200 that won't open
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back after an unopenable response: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("succeeded pin = %q, want fallback address %q", got, secondAddr)
+	}
+}
+
+// A response whose body drops mid-read is a provider-side failure with nothing
+// delivered to the caller, so the client falls back to the next candidate.
+func TestCompleteFallsBackOnBodyReadFailure(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.truncBodyPin = testProviderAddr // head's body drops mid-read
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back after a truncated body: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("succeeded pin = %q, want fallback address %q", got, secondAddr)
+	}
+}
+
+// A candidate with an empty canonical_id can't name the model in the sealed
+// request — a router contract violation the client rejects (so core skips it).
+func TestResolveRejectsMissingCanonicalID(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Blank the head's canonical_id after the fact by re-driving through a router
+	// that returns one; simplest is a direct check on materialization.
+	rc := cands.(*routeCandidates)
+	rc.providers[0].CanonicalID = ""
+	if _, err := rc.Provider(context.Background(), 0); err == nil || !strings.Contains(err.Error(), "canonical_id") {
+		t.Fatalf("want missing-canonical_id error, got %v", err)
+	}
+}
+
+// Streaming fallback is pre-first-token only: the head candidate fails before any
+// frame is delivered, so the client falls back to the second candidate and
+// streams from it.
+func TestCompleteStreamFallsBackBeforeFirstFrame(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	req := wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"the secret prompt"}]`),
+		"stream":   json.RawMessage(`true`),
+	}
+	var got strings.Builder
+	err := client.CompleteStream(context.Background(), req, func(frame wire.Response) error {
+		got.Write(frame["choices"])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream should have fallen back and streamed: %v", err)
+	}
+	if !strings.Contains(got.String(), "answer") {
+		t.Fatalf("did not stream after fallback: %s", got.String())
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("streamed pin = %q, want fallback address %q", got, secondAddr)
+	}
+}
+
 // WithSensitiveFields controls what the preview call withholds: the configured
 // fields (here a custom one) are stripped, other fields pass through for routing.
 func TestWithSensitiveFieldsStripsFromPreview(t *testing.T) {
@@ -311,7 +538,7 @@ func TestResolvePubkeyNon200(t *testing.T) {
 	broker.pubkeyStatus = http.StatusNotFound
 	router := newMockRouter(t, broker)
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusNotFound)
 }
 
@@ -321,7 +548,7 @@ func TestResolvePubkeyMalformed(t *testing.T) {
 	router := newMockRouter(t, broker)
 
 	// A decode failure is an upstream error with no meaningful status (→ 502).
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
 	assertStageStatus(t, err, core.StageUpstream, 0)
 }
 
@@ -329,7 +556,7 @@ func TestResolveProvider(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
 
-	p, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	p, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -338,6 +565,11 @@ func TestResolveProvider(t *testing.T) {
 	}
 	if p.Address != testProviderAddr {
 		t.Errorf("address = %q, want %q", p.Address, testProviderAddr)
+	}
+	// Model is the candidate's canonical_id, written into the sealed request's
+	// cleartext "model".
+	if p.Model != "canon-1" {
+		t.Errorf("model = %q, want canonical_id \"canon-1\"", p.Model)
 	}
 	// URL is the router's completions endpoint (auth/billing), not the provider's.
 	if want := router.srv.URL + "/v1/chat/completions"; p.URL != want {
@@ -354,7 +586,7 @@ func TestResolveCachesPubkey(t *testing.T) {
 	r := New(router.srv.URL)
 
 	for i := 0; i < 3; i++ {
-		if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		if _, err := resolveHead(context.Background(), r, chatReq()); err != nil {
 			t.Fatalf("Resolve #%d: %v", i, err)
 		}
 	}
@@ -369,7 +601,7 @@ func TestResolvePubkeyTTLDisablesCache(t *testing.T) {
 	r := New(router.srv.URL, WithPubkeyTTL(0))
 
 	for i := 0; i < 2; i++ {
-		if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		if _, err := resolveHead(context.Background(), r, chatReq()); err != nil {
 			t.Fatalf("Resolve #%d: %v", i, err)
 		}
 	}
@@ -378,13 +610,23 @@ func TestResolvePubkeyTTLDisablesCache(t *testing.T) {
 	}
 }
 
-func TestResolveNoModelIsBadRequest(t *testing.T) {
+// "model" is optional on the preview path (matching the execute path): a request
+// with no model resolves fine — the router previews any provider of the service
+// type — and the preview call simply omits the model.
+func TestResolveNoModelAllowed(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
 
-	req := wire.Request{"messages": json.RawMessage(`[]`)}
-	_, err := New(router.srv.URL).Resolve(context.Background(), req)
-	assertStageStatus(t, err, core.StageRequest, 0)
+	req := wire.Request{"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`)}
+	if _, err := resolveHead(context.Background(), New(router.srv.URL), req); err != nil {
+		t.Fatalf("Resolve with no model: %v", err)
+	}
+	if _, sent := router.lastPreview["model"]; sent {
+		t.Error("preview sent a model when the request had none")
+	}
+	if st := string(router.lastPreview["service_type"]); st != `"chatbot"` {
+		t.Errorf("preview service_type = %s, want \"chatbot\"", st)
+	}
 }
 
 func TestResolveSurfacesPreviewStatus(t *testing.T) {
@@ -405,16 +647,45 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 }
 
-// A provider with no address can't be pinned, so the router could re-route the
-// sealed request to a provider that can't decrypt it — reject up front.
+// A candidate with no address can't be pinned, so the router could re-route the
+// sealed request to a provider that can't decrypt it — materializing it fails so
+// core skips it.
 func TestResolveRejectsMissingAddress(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
-	router.previewAddress = "" // preview returns a provider with no address
+	router.previewAddress = "" // preview returns a head candidate with no address
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
 	if err == nil || !strings.Contains(err.Error(), "no address") {
 		t.Fatalf("want missing-address error, got %v", err)
+	}
+}
+
+// The preview list is the fallback chain: Resolve returns every candidate the
+// router ranked, so core can walk them, and each carries its own canonical_id.
+func TestResolveReturnsFullCandidateChain(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.extra = []previewProvider{{
+		Address:     "0xC0FFEE0000000000000000000000000000000002",
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+
+	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if cands.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 (head + one fallback)", cands.Len())
+	}
+	second, err := cands.Provider(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("materialize fallback candidate: %v", err)
+	}
+	if second.Model != "canon-2" || second.Address != "0xC0FFEE0000000000000000000000000000000002" {
+		t.Errorf("fallback candidate = %+v, want canon-2 / ...0002", second)
 	}
 }
 

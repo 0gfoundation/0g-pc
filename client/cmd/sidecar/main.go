@@ -28,7 +28,6 @@ import (
 func main() {
 	listen := flag.String("listen", "localhost:8787", "address to listen on")
 	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
-	routeType := flag.String("route-type", route.DefaultType, "inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
 
@@ -40,8 +39,9 @@ func main() {
 	// Route per request: pick the provider via the router and derive its enc key
 	// from the broker. The router is told to withhold exactly the sealed fields,
 	// so the prompt never reaches it in cleartext on the preview call.
+	// The sidecar serves only chat completions, so the route service type is fixed
+	// (route.New defaults to "chatbot"); it is not a startup choice.
 	router := route.New(*routerURL,
-		route.WithType(*routeType),
 		route.WithSensitiveFields(sealFields),
 	)
 	client := core.NewWithResolver(router, core.WithSealFields(sealFields))
